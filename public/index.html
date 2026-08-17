@@ -1,0 +1,566 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>shellHelper — Process Control Panel</title>
+
+    <link
+      rel="stylesheet"
+      href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.min.css"
+    />
+    <link
+      rel="stylesheet"
+      href="https://cdn.jsdelivr.net/npm/asciinema-player@3.7.1/dist/bundle/asciinema-player.css"
+    />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <!-- =========================== LOGIN =========================== -->
+    <div id="login-view" class="login-view" hidden>
+      <div class="login-card">
+        <div class="brand-mark large">◆</div>
+        <h1>shellHelper</h1>
+        <p class="login-sub">Sign in to manage your services</p>
+        <form id="login-form">
+          <label>
+            <span>Username</span>
+            <input name="username" type="text" autocomplete="username" required />
+          </label>
+          <label>
+            <span>Password</span>
+            <input
+              name="password"
+              type="password"
+              autocomplete="current-password"
+              required
+            />
+          </label>
+          <button type="submit" class="btn btn-primary">Sign in</button>
+          <p id="login-error" class="form-error" hidden></p>
+        </form>
+      </div>
+    </div>
+
+    <!-- ========================= DASHBOARD ========================= -->
+    <div id="dashboard-view" class="app" hidden>
+      <aside class="sidebar">
+        <header class="brand">
+          <div class="brand-mark">◆</div>
+          <div>
+            <h1>shellHelper</h1>
+            <p class="brand-sub">Process control panel</p>
+          </div>
+        </header>
+
+        <section class="sidebar-section">
+          <div class="section-heading">
+            <span>Services</span>
+            <button id="refresh-btn" class="ghost-btn" title="Refresh list">
+              ↻
+            </button>
+          </div>
+          <div class="scratchpad-launcher">
+            <button id="scratchpad-btn" class="btn btn-scratchpad" title="Spin up a disposable, sandboxed Linux shell (Docker). Files never touch the host; container is destroyed on close.">
+              + New Scratchpad
+            </button>
+            <label class="scratchpad-net" title="If off, the sandbox runs with --network=none — no internet, no LAN access at all.">
+              <input type="checkbox" id="scratchpad-network">
+              <span>Allow network</span>
+            </label>
+          </div>
+          <ul id="service-list" class="service-list">
+            <li class="service-empty">Loading…</li>
+          </ul>
+        </section>
+
+        <footer class="sidebar-footer">
+          <div class="metrics-panel">
+            <div class="metrics-heading">
+              <span id="metrics-scope-label">Host</span>
+              <span id="metrics-scope-sub" class="metrics-scope-sub">panel machine</span>
+            </div>
+            <div class="metric-row">
+              <span class="metric-label">CPU</span>
+              <div class="metric-bar"><div id="host-cpu-fill" class="metric-fill"></div></div>
+              <span id="host-cpu-value" class="metric-value">—</span>
+            </div>
+            <div class="metric-row">
+              <span class="metric-label">RAM</span>
+              <div class="metric-bar"><div id="host-mem-fill" class="metric-fill"></div></div>
+              <span id="host-mem-value" class="metric-value">—</span>
+            </div>
+            <div class="metric-row" id="host-disk-row">
+              <span class="metric-label">Disk</span>
+              <div class="metric-bar"><div id="host-disk-fill" class="metric-fill"></div></div>
+              <span id="host-disk-value" class="metric-value">—</span>
+            </div>
+          </div>
+          <div class="me-row">
+            <div>
+              <div class="me-name" id="me-username">—</div>
+              <div class="me-role" id="me-role">—</div>
+            </div>
+            <div class="me-actions">
+              <button id="admin-btn" class="ghost-btn" hidden title="Admin">
+                ⚙︎
+              </button>
+              <button id="prefs-btn" class="ghost-btn" title="Terminal preferences">
+                🎨
+              </button>
+              <button id="passwd-btn" class="ghost-btn" title="Change password">
+                🔑
+              </button>
+              <button id="logout-btn" class="ghost-btn" title="Sign out">
+                ⎋
+              </button>
+            </div>
+          </div>
+          <span id="connection-status" class="conn-dot conn-disconnected"
+            >disconnected</span
+          >
+        </footer>
+      </aside>
+
+      <main class="main">
+        <header class="main-header">
+          <div class="active-service">
+            <h2 id="active-name">No service selected</h2>
+            <p id="active-meta" class="active-meta">
+              Pick a service from the sidebar to open a terminal tab.
+            </p>
+            <div id="service-metrics" class="service-metrics" hidden>
+              <span class="metric-badge">
+                <span class="metric-badge-label">CPU</span>
+                <span id="svc-cpu-value">—</span>
+              </span>
+              <span class="metric-badge">
+                <span class="metric-badge-label">RAM</span>
+                <span id="svc-mem-value">—</span>
+              </span>
+              <canvas
+                id="svc-sparkline"
+                class="svc-sparkline"
+                width="160"
+                height="24"
+              ></canvas>
+            </div>
+          </div>
+          <div class="controls">
+            <button id="sftp-btn" class="btn btn-ghost" disabled hidden>Files</button>
+            <button id="logs-btn" class="btn btn-ghost" disabled>Logs</button>
+            <button id="start-btn" class="btn btn-start" disabled>Start</button>
+            <button id="restart-btn" class="btn btn-restart" disabled>Restart</button>
+            <button id="stop-btn" class="btn btn-stop" disabled>Stop</button>
+            <button id="clear-btn" class="btn btn-ghost" disabled>Clear</button>
+          </div>
+        </header>
+
+        <div id="tab-bar" class="tab-bar" hidden></div>
+
+        <div id="macro-bar" class="macro-bar" hidden></div>
+
+        <section class="terminal-wrapper">
+          <div id="terminals-container" class="terminals-container"></div>
+          <div id="terminal-placeholder" class="terminal-placeholder">
+            <div>
+              <div class="placeholder-mark">▍</div>
+              <p>Select a service from the sidebar to open a terminal tab.</p>
+            </div>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <!-- ========================= ADMIN MODAL ========================= -->
+    <div id="admin-modal" class="modal" hidden>
+      <div class="modal-backdrop" data-close="1"></div>
+      <div class="modal-card">
+        <header class="modal-header">
+          <h2>Administration</h2>
+          <button class="ghost-btn" data-close="1" title="Close">✕</button>
+        </header>
+
+        <nav class="tabs">
+          <button class="tab active" data-tab="users">Users</button>
+          <button class="tab" data-tab="shells">Shells</button>
+          <button class="tab" data-tab="hosts">Known SSH hosts</button>
+        </nav>
+
+        <div class="tab-panel" data-panel="users">
+          <div class="panel-cols">
+            <div>
+              <h3>Existing users</h3>
+              <ul id="admin-user-list" class="admin-list">
+                <li class="service-empty">Loading…</li>
+              </ul>
+            </div>
+            <div>
+              <h3>Create user</h3>
+              <form id="admin-user-form" class="form-stack">
+                <label>
+                  <span>Username</span>
+                  <input name="username" required />
+                </label>
+                <label>
+                  <span>Password (min 8 chars)</span>
+                  <input name="password" type="password" required />
+                </label>
+                <label>
+                  <span>Role</span>
+                  <select name="role">
+                    <option value="user">user</option>
+                    <option value="admin">admin</option>
+                  </select>
+                </label>
+                <button type="submit" class="btn btn-primary">Create user</button>
+                <p class="form-error" data-error hidden></p>
+              </form>
+            </div>
+          </div>
+        </div>
+
+        <div class="tab-panel" data-panel="shells" hidden>
+          <div class="panel-cols">
+            <div>
+              <h3>Existing shells</h3>
+              <ul id="admin-shell-list" class="admin-list">
+                <li class="service-empty">Loading…</li>
+              </ul>
+            </div>
+            <div>
+              <h3>Add shell</h3>
+              <form id="admin-shell-form" class="form-stack">
+                <label>
+                  <span>Type</span>
+                  <select name="type" id="shell-type">
+                    <option value="local">Local (on this machine)</option>
+                    <option value="ssh">Remote SSH machine</option>
+                    <option value="docker">Docker container</option>
+                  </select>
+                </label>
+                <label>
+                  <span>Display name</span>
+                  <input name="name" required placeholder="Prod DB Server" />
+                </label>
+
+                <div data-when-type="local">
+                  <label>
+                    <span>Command</span>
+                    <input
+                      name="command"
+                      placeholder="bash (defaults to your shell)"
+                    />
+                  </label>
+                  <label>
+                    <span>Args (space separated)</span>
+                    <input name="args" placeholder="-l" />
+                  </label>
+                  <label>
+                    <span>Working directory</span>
+                    <input name="cwd" placeholder="(defaults to $HOME)" />
+                  </label>
+                </div>
+
+                <div data-when-type="docker" hidden>
+                  <label>
+                    <span>Container id or name</span>
+                    <input name="containerId" placeholder="my-app or 3f1a…" />
+                  </label>
+                  <label>
+                    <span>Command inside container</span>
+                    <input name="dockerCommand" placeholder="/bin/sh" />
+                  </label>
+                  <label>
+                    <span>User (optional)</span>
+                    <input name="dockerUser" placeholder="root" />
+                  </label>
+                  <label>
+                    <span>Working directory (optional)</span>
+                    <input name="dockerWorkingDir" placeholder="/app" />
+                  </label>
+                </div>
+
+                <div data-when-type="ssh" hidden>
+                  <label>
+                    <span>Host / private IP</span>
+                    <input name="host" placeholder="10.0.0.42" />
+                  </label>
+                  <label>
+                    <span>Port</span>
+                    <input
+                      name="port"
+                      type="number"
+                      min="1"
+                      max="65535"
+                      value="22"
+                    />
+                  </label>
+                  <label>
+                    <span>SSH username</span>
+                    <input name="sshUser" placeholder="deploy" />
+                  </label>
+                  <label>
+                    <span>Auth method</span>
+                    <select name="sshAuthMethod" id="ssh-auth-method">
+                      <option value="password">Password</option>
+                      <option value="key">Private key</option>
+                    </select>
+                  </label>
+                  <div data-when-auth="password">
+                    <label>
+                      <span>SSH password</span>
+                      <input name="sshPassword" type="password" />
+                    </label>
+                  </div>
+                  <div data-when-auth="key" hidden>
+                    <label>
+                      <span>Private key (OpenSSH format)</span>
+                      <textarea
+                        name="sshPrivateKey"
+                        rows="6"
+                        placeholder="-----BEGIN OPENSSH PRIVATE KEY-----
+...
+-----END OPENSSH PRIVATE KEY-----"
+                      ></textarea>
+                    </label>
+                    <label>
+                      <span>Passphrase (optional)</span>
+                      <input name="sshPassphrase" type="password" />
+                    </label>
+                  </div>
+                </div>
+
+                <fieldset class="options-group">
+                  <legend>Supervision</legend>
+                  <label class="checkbox-row">
+                    <input type="checkbox" name="autostart" />
+                    <span>Autostart when panel boots</span>
+                  </label>
+                  <label class="checkbox-row">
+                    <input type="checkbox" name="autoRestart" />
+                    <span>Auto-restart on crash (up to 5x w/ backoff)</span>
+                  </label>
+                  <label class="checkbox-row">
+                    <input type="checkbox" name="recording" />
+                    <span>Record sessions (asciinema)</span>
+                  </label>
+                </fieldset>
+
+                <fieldset class="allowed-users">
+                  <legend>Allowed users (besides admins)</legend>
+                  <div id="allowed-users-picker" class="checkbox-grid">
+                    <span class="service-empty">Loading users…</span>
+                  </div>
+                </fieldset>
+
+                <button type="submit" class="btn btn-primary">Add shell</button>
+                <p class="form-error" data-error hidden></p>
+              </form>
+            </div>
+          </div>
+        </div>
+
+        <div class="tab-panel" data-panel="hosts" hidden>
+          <h3>Pinned SSH host keys (trust-on-first-use)</h3>
+          <ul id="admin-hosts-list" class="admin-list">
+            <li class="service-empty">Loading…</li>
+          </ul>
+          <p class="help-text">
+            Delete an entry only if you're sure the target host was legitimately
+            re-keyed. The next connection will trust and pin the new key.
+          </p>
+        </div>
+      </div>
+    </div>
+
+    <!-- ================== TERMINAL PREFERENCES ================== -->
+    <div id="prefs-modal" class="modal" hidden>
+      <div class="modal-backdrop" data-close="1"></div>
+      <div class="modal-card">
+        <header class="modal-header">
+          <h2>Terminal preferences</h2>
+          <button class="ghost-btn" data-close="1" title="Close">✕</button>
+        </header>
+        <div class="prefs-body">
+          <div class="prefs-grid">
+            <div>
+              <h3>Theme</h3>
+              <div id="prefs-theme-picker" class="theme-picker"></div>
+              <fieldset class="custom-theme" id="prefs-custom-theme" hidden>
+                <legend>Custom colours</legend>
+                <div id="prefs-custom-inputs" class="custom-color-grid"></div>
+              </fieldset>
+            </div>
+            <div>
+              <h3>Font</h3>
+              <form id="prefs-font-form" class="form-stack">
+                <label>
+                  <span>Font family</span>
+                  <select name="fontFamily" id="prefs-font-family"></select>
+                </label>
+                <label>
+                  <span>Font size (<span id="prefs-font-size-val">13</span> px)</span>
+                  <input
+                    type="range"
+                    name="fontSize"
+                    id="prefs-font-size"
+                    min="8"
+                    max="28"
+                    step="1"
+                    value="13"
+                  />
+                </label>
+              </form>
+              <h3>Preview</h3>
+              <div id="prefs-preview" class="prefs-preview"></div>
+            </div>
+          </div>
+          <div class="prefs-actions">
+            <button id="prefs-reset" class="btn btn-ghost">Reset to defaults</button>
+            <button id="prefs-save" class="btn btn-primary">Save preferences</button>
+          </div>
+          <p class="form-error" id="prefs-error" hidden></p>
+        </div>
+      </div>
+    </div>
+
+    <!-- ==================== CHANGE PASSWORD ==================== -->
+    <div id="passwd-modal" class="modal" hidden>
+      <div class="modal-backdrop" data-close="1"></div>
+      <div class="modal-card small">
+        <header class="modal-header">
+          <h2>Change password</h2>
+          <button class="ghost-btn" data-close="1" title="Close">✕</button>
+        </header>
+        <form id="passwd-form" class="form-stack">
+          <label>
+            <span>Current password</span>
+            <input name="currentPassword" type="password" required />
+          </label>
+          <label>
+            <span>New password (min 8 chars)</span>
+            <input name="newPassword" type="password" required />
+          </label>
+          <button type="submit" class="btn btn-primary">Update password</button>
+          <p class="form-error" data-error hidden></p>
+        </form>
+      </div>
+    </div>
+
+    <!-- ======================== SFTP MODAL ======================== -->
+    <div id="sftp-modal" class="modal" hidden>
+      <div class="modal-backdrop" data-close="1"></div>
+      <div class="modal-card">
+        <header class="modal-header">
+          <h2><span id="sftp-title">Files</span></h2>
+          <button class="ghost-btn" data-close="1" title="Close">✕</button>
+        </header>
+        <div class="sftp-toolbar">
+          <button id="sftp-up" class="btn btn-ghost" title="Parent directory">↑</button>
+          <input id="sftp-path" class="sftp-path" placeholder="/" />
+          <button id="sftp-go" class="btn">Go</button>
+          <button id="sftp-mkdir" class="btn">New folder</button>
+          <label class="btn btn-primary sftp-upload-label">
+            Upload<input id="sftp-upload" type="file" hidden />
+          </label>
+        </div>
+        <div id="sftp-list" class="sftp-list">
+          <div class="service-empty">Connect to browse remote files.</div>
+        </div>
+        <p class="form-error" id="sftp-error" hidden></p>
+      </div>
+    </div>
+
+    <!-- ===================== RECORDINGS MODAL ===================== -->
+    <div id="rec-modal" class="modal" hidden>
+      <div class="modal-backdrop" data-close="1"></div>
+      <div class="modal-card">
+        <header class="modal-header">
+          <h2><span id="rec-title">Recordings</span></h2>
+          <button class="ghost-btn" data-close="1" title="Close">✕</button>
+        </header>
+        <div class="rec-body">
+          <ul id="rec-list" class="admin-list rec-list">
+            <li class="service-empty">Loading…</li>
+          </ul>
+          <div id="rec-player-host" class="rec-player-host">
+            <div class="service-empty">Select a recording to play.</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ======================== LOGS MODAL ======================== -->
+    <div id="logs-modal" class="modal" hidden>
+      <div class="modal-backdrop" data-close="1"></div>
+      <div class="modal-card">
+        <header class="modal-header">
+          <h2><span id="logs-title">Persistent log</span></h2>
+          <div class="me-actions">
+            <button id="logs-refresh" class="ghost-btn" title="Reload">↻</button>
+            <button class="ghost-btn" data-close="1" title="Close">✕</button>
+          </div>
+        </header>
+        <pre id="logs-body" class="logs-body">Loading…</pre>
+      </div>
+    </div>
+
+    <!-- ==================== ALERT RULES EDITOR ==================== -->
+    <div id="alerts-modal" class="modal" hidden>
+      <div class="modal-backdrop" data-close="1"></div>
+      <div class="modal-card">
+        <header class="modal-header">
+          <h2><span id="alerts-title">Log alert rules</span></h2>
+          <button class="ghost-btn" data-close="1" title="Close">✕</button>
+        </header>
+        <div class="macros-editor">
+          <p class="help-text">
+            Every output line is matched against these regexes. When one hits,
+            the tab lights up and a toast appears — even if the tab is in the
+            background. ANSI colour codes are stripped before matching.
+          </p>
+          <div id="alerts-rows" class="macros-rows"></div>
+          <div class="macros-editor-actions">
+            <button id="alerts-add" class="btn">+ Add rule</button>
+            <button id="alerts-save" class="btn btn-primary">Save</button>
+          </div>
+          <p class="form-error" id="alerts-error" hidden></p>
+        </div>
+      </div>
+    </div>
+
+    <!-- ======================== TOASTS ========================== -->
+    <div id="toast-host" class="toast-host" aria-live="polite"></div>
+
+    <!-- ======================= MACROS EDITOR ======================= -->
+    <div id="macros-modal" class="modal" hidden>
+      <div class="modal-backdrop" data-close="1"></div>
+      <div class="modal-card">
+        <header class="modal-header">
+          <h2><span id="macros-title">Macros</span></h2>
+          <button class="ghost-btn" data-close="1" title="Close">✕</button>
+        </header>
+        <div class="macros-editor">
+          <p class="help-text">
+            Each macro appears as a button above the terminal. Clicking it types
+            the command into the shell exactly as written — end with <code>\n</code>
+            (or press Enter in the field when typing it) to auto-execute.
+          </p>
+          <div id="macros-rows" class="macros-rows"></div>
+          <div class="macros-editor-actions">
+            <button id="macros-add" class="btn">+ Add macro</button>
+            <button id="macros-save" class="btn btn-primary">Save</button>
+          </div>
+          <p class="form-error" id="macros-error" hidden></p>
+        </div>
+      </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/asciinema-player@3.7.1/dist/bundle/asciinema-player.min.js"></script>
+    <script src="/socket.io/socket.io.js"></script>
+    <script src="/app.js"></script>
+  </body>
+</html>

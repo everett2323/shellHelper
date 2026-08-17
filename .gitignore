@@ -1,0 +1,11 @@
+node_modules/
+.env
+.DS_Store
+.idea/
+
+# Runtime state (contains secrets / host-specific data)
+users.json
+services.json
+data/known_hosts.json
+data/logs/
+data/recordings/
