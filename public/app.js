@@ -19,8 +19,28 @@
     contextWatched: new Set(), // serviceIds we've asked the server to poll
     lastHostMetrics: null,
     alertState: new Map(), // serviceId -> { count, severity, lastAt }
+    tunnels: new Map(), // serviceId -> { active, url, port }
+    tunnelStarting: new Set(), // serviceIds mid-flight so double-clicks are ignored
+    inspectors: new Map(), // serviceId -> { active, listenPort, targetPort, captured }
+    inspectorHistory: new Map(), // serviceId -> [record, ...]
+    inspectorGitWatched: new Set(), // serviceIds we're watching git for
+    inspectorUi: {
+      openFor: null, // serviceId whose modal is currently open, or null
+      filter: '',
+      selectedRecordId: null,
+    },
+    gitStatus: new Map(), // serviceId -> snapshot
+    portConflict: { serviceId: null, port: null },
     macrosEditor: { serviceId: null, rows: [] },
     alertsEditor: { serviceId: null, rows: [] },
+    workspaces: [], // template + status summary from the server
+    activeWorkspaceId: null,
+    workspaceView: {
+      // Frontend-only UI knobs for the currently-focused workspace viewer.
+      autoConnect: true,
+      resize: true,
+      quality: 'medium',
+    },
   };
 
   let socket = null;
@@ -45,6 +65,69 @@
     activeMeta: $('#active-meta'),
     sftpBtn: $('#sftp-btn'),
     logsBtn: $('#logs-btn'),
+    tunnelBtn: $('#tunnel-btn'),
+    tunnelBar: $('#tunnel-bar'),
+    tunnelUrl: $('#tunnel-url'),
+    tunnelPort: $('#tunnel-port'),
+    tunnelCopyBtn: $('#tunnel-copy-btn'),
+    tunnelCopyLabel: $('#tunnel-copy-label'),
+    tunnelDisconnectBtn: $('#tunnel-disconnect-btn'),
+    tunnelModal: $('#tunnel-modal'),
+    tunnelForm: $('#tunnel-form'),
+    tunnelPortInput: $('#tunnel-port-input'),
+    tunnelPortSuggestions: $('#tunnel-port-suggestions'),
+    tunnelOpenBtn: $('#tunnel-open-btn'),
+    tunnelError: $('#tunnel-error'),
+
+    // Port conflict
+    portConflictModal: $('#port-conflict-modal'),
+    portConflictSummary: $('#port-conflict-summary'),
+    portConflictPort: $('#port-conflict-port'),
+    portConflictPid: $('#port-conflict-pid'),
+    portConflictCmd: $('#port-conflict-cmd'),
+    portConflictUser: $('#port-conflict-user'),
+    portConflictKill: $('#port-conflict-kill'),
+    portConflictForce: $('#port-conflict-force'),
+    portConflictCancel: $('#port-conflict-cancel'),
+    portConflictError: $('#port-conflict-error'),
+
+    // HTTP inspector
+    inspectorBtn: $('#inspector-btn'),
+    inspectorModal: $('#inspector-modal'),
+    inspectorTitle: $('#inspector-title'),
+    inspectorStateDot: $('#inspector-state-dot'),
+    inspectorStateLabel: $('#inspector-state-label'),
+    inspectorListenBanner: $('#inspector-listen-banner'),
+    inspectorListenUrl: $('#inspector-listen-url'),
+    inspectorListenCopy: $('#inspector-listen-copy'),
+    inspectorListenTarget: $('#inspector-listen-target'),
+    inspectorFilter: $('#inspector-filter'),
+    inspectorTargetPort: $('#inspector-target-port'),
+    inspectorToggleBtn: $('#inspector-toggle-btn'),
+    inspectorClearBtn: $('#inspector-clear-btn'),
+    inspectorRows: $('#inspector-rows'),
+    inspectorEmpty: $('#inspector-empty'),
+    inspectorDetails: $('#inspector-details'),
+    inspectorDetailMethod: $('#inspector-detail-method'),
+    inspectorDetailUrl: $('#inspector-detail-url'),
+    inspectorDetailClose: $('#inspector-detail-close'),
+    inspectorDetailReqHeaders: $('#inspector-detail-req-headers'),
+    inspectorDetailReqBody: $('#inspector-detail-req-body'),
+    inspectorDetailReqMeta: $('#inspector-detail-req-meta'),
+    inspectorDetailResHeaders: $('#inspector-detail-res-headers'),
+    inspectorDetailResBody: $('#inspector-detail-res-body'),
+    inspectorDetailResMeta: $('#inspector-detail-res-meta'),
+    inspectorError: $('#inspector-error'),
+
+    // Git widget
+    gitWidget: $('#git-widget'),
+    gitWidgetBranch: $('#git-widget-branch'),
+    gitWidgetTrack: $('#git-widget-track'),
+    gitWidgetDirty: $('#git-widget-dirty'),
+    gitPullBtn: $('#git-pull-btn'),
+    gitStashBtn: $('#git-stash-btn'),
+    gitFetchBtn: $('#git-fetch-btn'),
+
     startBtn: $('#start-btn'),
     stopBtn: $('#stop-btn'),
     restartBtn: $('#restart-btn'),
@@ -135,6 +218,28 @@
     alertsSave: $('#alerts-save'),
     alertsError: $('#alerts-error'),
     toastHost: $('#toast-host'),
+
+    // Workspaces (graphical container streaming)
+    workspaceList: $('#workspace-list'),
+    workspacesRefresh: $('#workspaces-refresh-btn'),
+    workspaceControls: $('#workspace-controls'),
+    workspaceControlsName: $('#workspace-controls-name'),
+    workspaceControlsStatus: $('#workspace-controls-status'),
+    workspaceAutoConnect: $('#workspace-autoconnect'),
+    workspaceResize: $('#workspace-resize'),
+    workspaceQuality: $('#workspace-quality'),
+    workspaceStartBtn: $('#workspace-start-btn'),
+    workspaceStopBtn: $('#workspace-stop-btn'),
+    workspaceReloadBtn: $('#workspace-reload-btn'),
+    workspaceFullscreenBtn: $('#workspace-fullscreen-btn'),
+    workspaceClipboardBtn: $('#workspace-clipboard-btn'),
+    workspaceViewport: $('#workspace-viewport'),
+    workspaceFrame: $('#workspace-frame'),
+    workspaceLoading: $('#workspace-loading'),
+    workspaceLoadingText: $('#workspace-loading-text'),
+    adminWorkspaceList: $('#admin-workspace-list'),
+    adminWorkspaceForm: $('#admin-workspace-form'),
+    workspaceAllowedUsers: $('#workspace-allowed-users'),
   };
 
   // ---------------------------------------------------------------------
@@ -310,6 +415,7 @@
     hostEl.addEventListener('click', () => term.focus());
 
     subscribe(serviceId, tab);
+    watchGit(serviceId);
     renderTabBar();
     return tab;
   }
@@ -344,7 +450,9 @@
     tab.hostEl.remove();
     state.tabs.splice(idx, 1);
     unwatchContext(serviceId);
+    unwatchGit(serviceId);
     state.contextMetrics.delete(serviceId);
+    state.gitStatus.delete(serviceId);
     clearAlertState(serviceId);
     if (socket) socket.emit('unsubscribe-service', { id: serviceId });
     // Belt & braces: the server also reaps on last-viewer leave, but hitting the
@@ -377,6 +485,9 @@
   function activateTab(serviceId) {
     const tab = findTab(serviceId);
     if (!tab) return;
+    // Switching to a shell tab hides the workspace viewer (and releases its
+    // refcount so idle-reaping resumes).
+    if (state.activeWorkspaceId) deactivateWorkspace();
     state.activeTabId = serviceId;
     for (const t of state.tabs) {
       t.hostEl.classList.toggle('active', t.serviceId === serviceId);
@@ -598,10 +709,14 @@
         clear: false,
         sftp: false,
         logs: false,
+        tunnel: false,
       });
       els.sftpBtn.hidden = true;
+      els.inspectorBtn.hidden = true;
+      els.gitWidget.hidden = true;
       clearServiceMetrics();
       renderMetricsPanel();
+      renderTunnelBar();
       return;
     }
     // The compact header badges are LOCAL-only (pidusage). SSH/Docker context
@@ -640,17 +755,24 @@
       clear: true,
       sftp: svc.type === 'ssh',
       logs: true,
+      // A tunnel targets a local port opened by the process — no point wiring
+      // it up when nothing is running behind it.
+      tunnel: running,
     });
     renderMetricsPanel();
+    renderTunnelBar();
+    renderInspectorHeaderButton();
+    renderGitWidget();
   }
 
-  function setControlsEnabled({ start, stop, restart, clear, sftp, logs }) {
+  function setControlsEnabled({ start, stop, restart, clear, sftp, logs, tunnel }) {
     els.startBtn.disabled = !start;
     els.stopBtn.disabled = !stop;
     els.restartBtn.disabled = !restart;
     els.clearBtn.disabled = !clear;
     els.sftpBtn.disabled = !sftp;
     els.logsBtn.disabled = !logs;
+    els.tunnelBtn.disabled = !tunnel;
   }
 
   // ---------------------------------------------------------------------
@@ -693,16 +815,42 @@
 
   els.startBtn.addEventListener('click', () => {
     const tab = activeTab();
-    if (!tab || !socket) return;
-    socket.emit('start-service', { id: tab.serviceId }, (ack) => {
-      if (ack && !ack.ok) {
-        tab.term.writeln(`\x1b[31m[shellHelper] start failed: ${ack.error}\x1b[0m`);
+    if (!tab) return;
+    requestServiceStart(tab.serviceId, { force: false });
+  });
+
+  async function requestServiceStart(serviceId, { force }) {
+    const tab = findTab(serviceId);
+    try {
+      const res = await fetch(`/api/services/${serviceId}/start`, {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ force: !!force }),
+      });
+      let body = null;
+      try {
+        body = await res.json();
+      } catch {
+        /* noop */
+      }
+      if (res.status === 409 && body && body.conflict) {
+        openPortConflictModal(serviceId, body.conflict);
         return;
       }
-      fitTerminalFor(tab);
-      tab.term.focus();
-    });
-  });
+      if (!res.ok) {
+        const msg = (body && body.error) || `${res.status} ${res.statusText}`;
+        if (tab) tab.term.writeln(`\x1b[31m[shellHelper] start failed: ${msg}\x1b[0m`);
+        return;
+      }
+      if (tab) {
+        fitTerminalFor(tab);
+        tab.term.focus();
+      }
+    } catch (err) {
+      if (tab) tab.term.writeln(`\x1b[31m[shellHelper] start failed: ${err.message}\x1b[0m`);
+    }
+  }
 
   els.stopBtn.addEventListener('click', () => {
     const tab = activeTab();
@@ -731,6 +879,561 @@
   els.sftpBtn.addEventListener('click', () => openSftpFor(state.activeTabId));
 
   // ---------------------------------------------------------------------
+  //   Public tunnel (cloudflared)
+  // ---------------------------------------------------------------------
+  els.tunnelBtn.addEventListener('click', () => {
+    const id = state.activeTabId;
+    if (!id) return;
+    const info = state.tunnels.get(id);
+    if (info && info.active) {
+      disconnectTunnel(id);
+      return;
+    }
+    openTunnelPrompt(id);
+  });
+
+  els.tunnelDisconnectBtn.addEventListener('click', () => {
+    if (state.activeTabId) disconnectTunnel(state.activeTabId);
+  });
+
+  els.tunnelCopyBtn.addEventListener('click', async () => {
+    const info = state.tunnels.get(state.activeTabId);
+    if (!info || !info.url) return;
+    try {
+      await navigator.clipboard.writeText(info.url);
+      els.tunnelCopyLabel.textContent = 'Copied!';
+      setTimeout(() => {
+        els.tunnelCopyLabel.textContent = 'Copy';
+      }, 1400);
+    } catch {
+      // Fallback: select the anchor text so the user can Cmd/Ctrl+C manually.
+      const range = document.createRange();
+      range.selectNodeContents(els.tunnelUrl);
+      const sel = window.getSelection();
+      sel.removeAllRanges();
+      sel.addRange(range);
+    }
+  });
+
+  els.tunnelPortSuggestions.addEventListener('click', (event) => {
+    const btn = event.target.closest('button[data-port]');
+    if (!btn) return;
+    els.tunnelPortInput.value = btn.dataset.port;
+    els.tunnelPortInput.focus();
+  });
+
+  els.tunnelForm.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const id = state.activeTabId;
+    if (!id) return;
+    clearError(els.tunnelError);
+    const port = Number(els.tunnelPortInput.value);
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
+      showError(els.tunnelError, 'Port must be an integer 1–65535.');
+      return;
+    }
+    els.tunnelOpenBtn.disabled = true;
+    els.tunnelOpenBtn.textContent = 'Opening…';
+    state.tunnelStarting.add(id);
+    // Optimistically mark active so the toolbar switches to "connecting" state.
+    state.tunnels.set(id, { active: true, url: null, port });
+    renderTunnelBar();
+    renderTunnelButton();
+    try {
+      const body = await api(`/api/services/${id}/tunnel/start`, {
+        method: 'POST',
+        body: JSON.stringify({ port }),
+      });
+      state.tunnels.set(id, {
+        active: true,
+        url: body.url,
+        port: body.port || port,
+      });
+      els.tunnelModal.hidden = true;
+      renderTunnelBar();
+      renderTunnelButton();
+      showTunnelToast('Public tunnel opened', body.url);
+    } catch (err) {
+      state.tunnels.delete(id);
+      showError(els.tunnelError, err.message);
+      renderTunnelBar();
+      renderTunnelButton();
+    } finally {
+      state.tunnelStarting.delete(id);
+      els.tunnelOpenBtn.disabled = false;
+      els.tunnelOpenBtn.textContent = 'Open tunnel';
+    }
+  });
+
+  function openTunnelPrompt(serviceId) {
+    clearError(els.tunnelError);
+    const cached = state.tunnels.get(serviceId);
+    if (cached && cached.port) els.tunnelPortInput.value = String(cached.port);
+    openModal(els.tunnelModal);
+    setTimeout(() => els.tunnelPortInput.select(), 30);
+  }
+
+  async function disconnectTunnel(serviceId) {
+    try {
+      await api(`/api/services/${serviceId}/tunnel/stop`, { method: 'POST' });
+      state.tunnels.delete(serviceId);
+      renderTunnelBar();
+      renderTunnelButton();
+    } catch (err) {
+      showTunnelToast('Could not stop tunnel', err.message, 'crit');
+    }
+  }
+
+  function renderTunnelButton() {
+    const id = state.activeTabId;
+    const info = id ? state.tunnels.get(id) : null;
+    const label = els.tunnelBtn.querySelector('.tunnel-label');
+    if (info && info.active) {
+      els.tunnelBtn.classList.add('active');
+      if (label) label.textContent = info.url ? 'Tunnel live' : 'Connecting…';
+    } else {
+      els.tunnelBtn.classList.remove('active');
+      if (label) label.textContent = 'Public Tunnel';
+    }
+  }
+
+  function renderTunnelBar() {
+    const id = state.activeTabId;
+    const info = id ? state.tunnels.get(id) : null;
+    if (!info || !info.active) {
+      els.tunnelBar.hidden = true;
+      renderTunnelButton();
+      return;
+    }
+    els.tunnelBar.hidden = false;
+    if (info.url) {
+      els.tunnelUrl.textContent = info.url;
+      els.tunnelUrl.href = info.url;
+      els.tunnelCopyBtn.disabled = false;
+    } else {
+      els.tunnelUrl.textContent = 'waiting for cloudflared…';
+      els.tunnelUrl.removeAttribute('href');
+      els.tunnelCopyBtn.disabled = true;
+    }
+    els.tunnelPort.textContent = info.port ? `→ localhost:${info.port}` : '';
+    renderTunnelButton();
+  }
+
+  function showTunnelToast(title, detail, severity) {
+    showToast(title, detail, severity);
+  }
+
+  function showToast(title, detail, severity) {
+    if (!els.toastHost) return;
+    const div = document.createElement('div');
+    div.className = 'toast' + (severity === 'crit' ? ' crit' : '');
+    const t = document.createElement('div');
+    t.className = 'toast-title';
+    const left = document.createElement('span');
+    left.textContent = title;
+    t.appendChild(left);
+    const line = document.createElement('div');
+    line.className = 'toast-line';
+    line.textContent = detail || '';
+    div.appendChild(t);
+    div.appendChild(line);
+    els.toastHost.appendChild(div);
+    while (els.toastHost.children.length > 5) {
+      els.toastHost.firstElementChild.remove();
+    }
+    setTimeout(() => {
+      div.style.transition = 'opacity 300ms ease';
+      div.style.opacity = '0';
+      setTimeout(() => div.remove(), 350);
+    }, 5000);
+  }
+
+  // ---------------------------------------------------------------------
+  //   Port conflict modal
+  // ---------------------------------------------------------------------
+  function openPortConflictModal(serviceId, conflict) {
+    state.portConflict = { serviceId, port: conflict.servicePort || conflict.port };
+    clearError(els.portConflictError);
+    const svc = svcById(serviceId);
+    els.portConflictSummary.textContent = svc
+      ? `"${svc.name}" wants port ${conflict.port}, but it's already bound.`
+      : `Port ${conflict.port} is already bound.`;
+    els.portConflictPort.textContent = conflict.port;
+    els.portConflictPid.textContent = conflict.pid ?? '(unknown)';
+    els.portConflictCmd.textContent = conflict.command || '(unknown)';
+    els.portConflictUser.textContent = conflict.user || '(unknown)';
+    els.portConflictKill.disabled = !conflict.pid;
+    openModal(els.portConflictModal);
+  }
+
+  els.portConflictCancel.addEventListener('click', () => {
+    els.portConflictModal.hidden = true;
+  });
+
+  els.portConflictForce.addEventListener('click', () => {
+    const { serviceId } = state.portConflict;
+    els.portConflictModal.hidden = true;
+    if (serviceId) requestServiceStart(serviceId, { force: true });
+  });
+
+  els.portConflictKill.addEventListener('click', async () => {
+    const { serviceId } = state.portConflict;
+    if (!serviceId) return;
+    clearError(els.portConflictError);
+    els.portConflictKill.disabled = true;
+    els.portConflictKill.textContent = 'Killing…';
+    try {
+      const res = await api(`/api/services/${serviceId}/kill-blocker`, {
+        method: 'POST',
+      });
+      showToast(
+        'Port freed',
+        res.killed ? `PID ${res.pid} terminated on port ${res.port}` : 'Port was already free',
+      );
+      els.portConflictModal.hidden = true;
+      // Retry — the port should be free now. `force: true` skips the pre-check
+      // so we don't loop into the same modal if lsof is slow to update.
+      requestServiceStart(serviceId, { force: true });
+    } catch (err) {
+      showError(els.portConflictError, err.message);
+    } finally {
+      els.portConflictKill.disabled = false;
+      els.portConflictKill.textContent = 'Kill & Start';
+    }
+  });
+
+  // ---------------------------------------------------------------------
+  //   HTTP inspector
+  // ---------------------------------------------------------------------
+  els.inspectorBtn.addEventListener('click', () => {
+    const svc = state.activeTabId ? svcById(state.activeTabId) : null;
+    if (!svc) return;
+    openInspectorModal(svc);
+  });
+
+  els.inspectorDetailClose.addEventListener('click', () => {
+    state.inspectorUi.selectedRecordId = null;
+    els.inspectorDetails.hidden = true;
+    renderInspectorRows();
+  });
+
+  els.inspectorFilter.addEventListener('input', () => {
+    state.inspectorUi.filter = els.inspectorFilter.value.trim().toLowerCase();
+    renderInspectorRows();
+  });
+
+  els.inspectorToggleBtn.addEventListener('click', async () => {
+    const serviceId = state.inspectorUi.openFor;
+    if (!serviceId) return;
+    const status = state.inspectors.get(serviceId);
+    clearError(els.inspectorError);
+    if (status && status.active) {
+      try {
+        await api(`/api/services/${serviceId}/inspector/stop`, { method: 'POST' });
+      } catch (err) {
+        showError(els.inspectorError, err.message);
+      }
+      return;
+    }
+    const port = Number(els.inspectorTargetPort.value);
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
+      showError(els.inspectorError, 'Enter a target port (1–65535).');
+      return;
+    }
+    els.inspectorToggleBtn.disabled = true;
+    try {
+      await api(`/api/services/${serviceId}/inspector/start`, {
+        method: 'POST',
+        body: JSON.stringify({ targetPort: port }),
+      });
+    } catch (err) {
+      showError(els.inspectorError, err.message);
+    } finally {
+      els.inspectorToggleBtn.disabled = false;
+    }
+  });
+
+  // Clear `openFor` whenever the inspector modal is hidden — otherwise, live
+  // captures for a service we're no longer viewing would still re-render the
+  // (invisible) table.
+  new MutationObserver(() => {
+    if (els.inspectorModal.hidden) state.inspectorUi.openFor = null;
+  }).observe(els.inspectorModal, { attributes: true, attributeFilter: ['hidden'] });
+
+  els.inspectorListenCopy.addEventListener('click', async () => {
+    const url = els.inspectorListenUrl.textContent || '';
+    if (!url || url === '—') return;
+    try {
+      await navigator.clipboard.writeText(url);
+      els.inspectorListenCopy.textContent = 'Copied!';
+      setTimeout(() => (els.inspectorListenCopy.textContent = 'Copy'), 1200);
+    } catch {
+      /* clipboard may be blocked; the URL is right there next to the button */
+    }
+  });
+
+  els.inspectorClearBtn.addEventListener('click', async () => {
+    const serviceId = state.inspectorUi.openFor;
+    if (!serviceId) return;
+    try {
+      await api(`/api/services/${serviceId}/inspector/clear`, { method: 'POST' });
+      state.inspectorHistory.set(serviceId, []);
+      state.inspectorUi.selectedRecordId = null;
+      els.inspectorDetails.hidden = true;
+      renderInspectorRows();
+    } catch (err) {
+      showError(els.inspectorError, err.message);
+    }
+  });
+
+  async function openInspectorModal(svc) {
+    state.inspectorUi.openFor = svc.id;
+    state.inspectorUi.selectedRecordId = null;
+    state.inspectorUi.filter = '';
+    els.inspectorFilter.value = '';
+    els.inspectorTitle.textContent = `HTTP Traffic — ${svc.name}`;
+    els.inspectorDetails.hidden = true;
+    clearError(els.inspectorError);
+    // Seed target port from the service definition when known.
+    const cached = state.inspectors.get(svc.id);
+    if (cached && cached.targetPort) els.inspectorTargetPort.value = cached.targetPort;
+    else if (svc.servicePort) els.inspectorTargetPort.value = svc.servicePort;
+    openModal(els.inspectorModal);
+    renderInspectorState();
+    renderInspectorRows();
+    try {
+      const { history } = await api(`/api/services/${svc.id}/inspector/history`);
+      state.inspectorHistory.set(svc.id, history || []);
+      renderInspectorRows();
+    } catch {
+      /* history is best-effort */
+    }
+  }
+
+  function renderInspectorHeaderButton() {
+    const id = state.activeTabId;
+    const svc = id ? svcById(id) : null;
+    // The button is only meaningful for local services — the inspector proxies
+    // HTTP to a port on this host, which docker/ssh services don't expose here.
+    const eligible = !!(svc && svc.type === 'local');
+    els.inspectorBtn.hidden = !eligible;
+    els.inspectorBtn.disabled = !eligible;
+    const status = id ? state.inspectors.get(id) : null;
+    const active = !!(status && status.active);
+    const label = els.inspectorBtn.querySelector('.inspector-label');
+    if (active) {
+      els.inspectorBtn.classList.add('active');
+      if (label) label.textContent = `HTTP Traffic · ${status.captured || 0}`;
+    } else {
+      els.inspectorBtn.classList.remove('active');
+      if (label) label.textContent = 'HTTP Traffic';
+    }
+  }
+
+  function renderInspectorState() {
+    const serviceId = state.inspectorUi.openFor;
+    const status = serviceId ? state.inspectors.get(serviceId) : null;
+    const active = !!(status && status.active);
+    els.inspectorStateDot.classList.toggle('active', active);
+    els.inspectorStateLabel.textContent = active ? 'capturing' : 'inactive';
+    els.inspectorToggleBtn.textContent = active ? 'Stop capture' : 'Start capture';
+    els.inspectorToggleBtn.classList.toggle('btn-primary', !active);
+    els.inspectorToggleBtn.classList.toggle('btn-stop', active);
+    if (active) {
+      const url = `http://127.0.0.1:${status.listenPort}`;
+      els.inspectorListenBanner.hidden = false;
+      els.inspectorListenUrl.textContent = url;
+      els.inspectorListenUrl.href = url;
+      els.inspectorListenTarget.textContent = `→ forwards to localhost:${status.targetPort}`;
+    } else {
+      els.inspectorListenBanner.hidden = true;
+    }
+    // Toolbar button in the header
+    const btnLabel = els.inspectorBtn.querySelector('.inspector-label');
+    if (active) {
+      els.inspectorBtn.classList.add('active');
+      if (btnLabel) btnLabel.textContent = `HTTP Traffic · ${status.captured || 0}`;
+    } else {
+      els.inspectorBtn.classList.remove('active');
+      if (btnLabel) btnLabel.textContent = 'HTTP Traffic';
+    }
+  }
+
+  function renderInspectorRows() {
+    const serviceId = state.inspectorUi.openFor;
+    if (!serviceId) return;
+    const records = state.inspectorHistory.get(serviceId) || [];
+    const filter = state.inspectorUi.filter;
+    const filtered = filter
+      ? records.filter(
+          (r) =>
+            r.method.toLowerCase().includes(filter) ||
+            (r.url || '').toLowerCase().includes(filter),
+        )
+      : records;
+    els.inspectorEmpty.style.display = filtered.length ? 'none' : '';
+    els.inspectorRows.innerHTML = '';
+    // Newest first is easier to read for live capture.
+    for (const r of filtered.slice().reverse()) {
+      const tr = document.createElement('tr');
+      if (r.id === state.inspectorUi.selectedRecordId) tr.classList.add('selected');
+      const method = document.createElement('td');
+      const mBadge = document.createElement('span');
+      mBadge.className = 'inspector-method ' + String(r.method || '').toLowerCase();
+      mBadge.textContent = r.method || '?';
+      method.appendChild(mBadge);
+      const status = document.createElement('td');
+      status.className = 'inspector-status ' + statusClass(r.status);
+      status.textContent = r.status;
+      const url = document.createElement('td');
+      url.className = 'col-url';
+      url.textContent = r.url || '';
+      url.title = r.url || '';
+      const latency = document.createElement('td');
+      latency.textContent = `${r.durationMs} ms`;
+      const time = document.createElement('td');
+      const d = new Date(r.timestamp);
+      time.textContent = d.toLocaleTimeString([], { hour12: false });
+      tr.appendChild(method);
+      tr.appendChild(status);
+      tr.appendChild(url);
+      tr.appendChild(latency);
+      tr.appendChild(time);
+      tr.addEventListener('click', () => openInspectorDetails(r));
+      els.inspectorRows.appendChild(tr);
+    }
+  }
+
+  function statusClass(status) {
+    const s = Number(status) || 0;
+    if (s >= 500) return 'err';
+    if (s >= 400) return 'warn';
+    if (s >= 300) return 'redir';
+    if (s >= 200) return 'ok';
+    return '';
+  }
+
+  function openInspectorDetails(record) {
+    state.inspectorUi.selectedRecordId = record.id;
+    els.inspectorDetails.hidden = false;
+    els.inspectorDetailMethod.textContent = record.method || '?';
+    els.inspectorDetailUrl.textContent = record.url || '';
+    els.inspectorDetailReqHeaders.textContent = formatHeaders(record.requestHeaders);
+    els.inspectorDetailReqBody.textContent = record.requestBody
+      ? record.requestBody.text || '(empty)'
+      : '(empty)';
+    els.inspectorDetailReqMeta.textContent = bodyMeta(record.requestBody);
+    els.inspectorDetailResHeaders.textContent = formatHeaders(record.responseHeaders);
+    els.inspectorDetailResBody.textContent = record.responseBody
+      ? record.responseBody.text || '(empty)'
+      : '(empty)';
+    els.inspectorDetailResMeta.textContent = bodyMeta(record.responseBody);
+    renderInspectorRows();
+  }
+
+  function formatHeaders(h) {
+    if (!h) return '';
+    return Object.entries(h)
+      .map(([k, v]) => `${k}: ${Array.isArray(v) ? v.join(', ') : v}`)
+      .join('\n');
+  }
+
+  function bodyMeta(body) {
+    if (!body) return '';
+    const size = typeof body.size === 'number' ? `${body.size} B` : '';
+    const enc = body.encoding && body.encoding !== 'utf8' ? ` · ${body.encoding}` : '';
+    const trunc = body.truncated ? ' · truncated' : '';
+    return [size, enc, trunc].filter(Boolean).join('');
+  }
+
+  // ---------------------------------------------------------------------
+  //   Git widget
+  // ---------------------------------------------------------------------
+  els.gitPullBtn.addEventListener('click', () => runGitAction('pull'));
+  els.gitStashBtn.addEventListener('click', () => runGitAction('stash'));
+  els.gitFetchBtn.addEventListener('click', () => runGitAction('fetch'));
+
+  async function runGitAction(action) {
+    const id = state.activeTabId;
+    if (!id) return;
+    setGitActionsDisabled(true);
+    try {
+      const res = await api(`/api/services/${id}/git/${action}`, { method: 'POST' });
+      if (res.ok) {
+        showToast(`git ${action}`, (res.stdout || res.stderr || '').split('\n')[0] || 'ok');
+      } else {
+        showToast(`git ${action} failed`, res.stderr || 'see server logs', 'crit');
+      }
+      // The action's refresh already emitted a git-status event; render just
+      // in case the socket is currently offline.
+      if (res.snapshot) {
+        state.gitStatus.set(id, res.snapshot);
+        if (id === state.activeTabId) renderGitWidget();
+      }
+    } catch (err) {
+      showToast(`git ${action} failed`, err.message, 'crit');
+    } finally {
+      setGitActionsDisabled(false);
+    }
+  }
+
+  function setGitActionsDisabled(disabled) {
+    els.gitPullBtn.disabled = disabled;
+    els.gitStashBtn.disabled = disabled;
+    els.gitFetchBtn.disabled = disabled;
+  }
+
+  function watchGit(serviceId) {
+    if (!socket || state.inspectorGitWatched.has(serviceId)) return;
+    state.inspectorGitWatched.add(serviceId);
+    socket.emit('watch-git', { id: serviceId });
+  }
+
+  function unwatchGit(serviceId) {
+    if (!socket || !state.inspectorGitWatched.has(serviceId)) return;
+    state.inspectorGitWatched.delete(serviceId);
+    socket.emit('unwatch-git', { id: serviceId });
+  }
+
+  function renderGitWidget() {
+    const id = state.activeTabId;
+    const svc = id ? svcById(id) : null;
+    // The server resolves the cwd (falling back to $HOME) — trust its verdict
+    // rather than second-guessing here. If `repo: false` comes back, the
+    // widget stays hidden.
+    if (!svc || svc.type !== 'local') {
+      els.gitWidget.hidden = true;
+      return;
+    }
+    const snap = state.gitStatus.get(id);
+    if (!snap || !snap.repo) {
+      els.gitWidget.hidden = true;
+      return;
+    }
+    els.gitWidget.hidden = false;
+    els.gitWidgetBranch.textContent = snap.branch || '(detached)';
+    const trackBits = [];
+    if (snap.ahead) trackBits.push(`↑${snap.ahead}`);
+    if (snap.behind) trackBits.push(`↓${snap.behind}`);
+    els.gitWidgetTrack.textContent = trackBits.join(' ');
+    const dirty = (snap.staged || 0) + (snap.modified || 0) + (snap.untracked || 0);
+    els.gitWidgetDirty.textContent = dirty ? `● ${dirty}` : '';
+    els.gitWidget.classList.toggle('dirty', dirty > 0);
+    els.gitWidget.classList.toggle('ahead', (snap.ahead || 0) > 0);
+    els.gitWidget.classList.toggle('behind', (snap.behind || 0) > 0);
+    els.gitPullBtn.disabled = !snap.upstream;
+    els.gitFetchBtn.disabled = !snap.upstream;
+    // Enrich the tooltip so hover reveals a fuller picture without opening a modal.
+    const parts = [
+      `branch: ${snap.branch}`,
+      snap.upstream ? `upstream: ${snap.upstream}` : 'no upstream',
+      `staged: ${snap.staged}, modified: ${snap.modified}, untracked: ${snap.untracked}`,
+    ];
+    if (snap.lastCommit) parts.push(`last: ${snap.lastCommit.sha} ${snap.lastCommit.subject}`);
+    els.gitWidget.title = parts.join('\n');
+  }
+
+  // ---------------------------------------------------------------------
   //   Socket
   // ---------------------------------------------------------------------
   function connectSocket() {
@@ -744,6 +1447,10 @@
       // Re-subscribe any open tabs after reconnect.
       for (const t of state.tabs) subscribe(t.serviceId, t);
       resubscribeContexts();
+      // Rebuild git watches from scratch — the server clears them on disconnect.
+      const gitIds = Array.from(state.inspectorGitWatched);
+      state.inspectorGitWatched.clear();
+      for (const id of gitIds) watchGit(id);
     });
 
     socket.on('disconnect', () => {
@@ -815,6 +1522,104 @@
     });
 
     socket.on('log-alert', handleLogAlert);
+
+    socket.on('tunnel-status', ({ id, active, url, port }) => {
+      if (!id) return;
+      if (active) {
+        state.tunnels.set(id, { active: true, url: url || null, port: port || null });
+      } else {
+        state.tunnels.delete(id);
+      }
+      if (id === state.activeTabId) {
+        renderTunnelBar();
+        renderTunnelButton();
+      }
+    });
+
+    socket.on('tunnel-error', ({ id, message }) => {
+      if (!id) return;
+      // The starter promise already surfaces its own error via the modal —
+      // avoid double-toasting while the request is in flight.
+      if (state.tunnelStarting.has(id)) return;
+      showTunnelToast('Tunnel error', message, 'crit');
+    });
+
+    socket.on('inspector-status', ({ id, active, listenPort, targetPort, captured }) => {
+      if (!id) return;
+      if (active) {
+        state.inspectors.set(id, {
+          active: true,
+          listenPort,
+          targetPort,
+          captured: captured || 0,
+        });
+      } else {
+        state.inspectors.delete(id);
+      }
+      // Only refresh the header for the currently-active tab. The modal
+      // refreshes its own state whenever it's open for the affected service.
+      if (id === state.activeTabId) renderInspectorHeaderButton();
+      if (state.inspectorUi.openFor === id) renderInspectorState();
+    });
+
+    socket.on('http-capture', ({ id, record }) => {
+      if (!id || !record) return;
+      const arr = state.inspectorHistory.get(id) || [];
+      arr.push(record);
+      // Match the server's rolling limit so the UI doesn't grow unbounded.
+      while (arr.length > 200) arr.shift();
+      state.inspectorHistory.set(id, arr);
+      const cur = state.inspectors.get(id);
+      if (cur) {
+        cur.captured = (cur.captured || 0) + 1;
+        if (id === state.activeTabId) renderInspectorHeaderButton();
+      }
+      if (state.inspectorUi.openFor === id) renderInspectorRows();
+    });
+
+    socket.on('inspector-cleared', ({ id }) => {
+      state.inspectorHistory.set(id, []);
+      if (state.inspectorUi.openFor === id) {
+        state.inspectorUi.selectedRecordId = null;
+        els.inspectorDetails.hidden = true;
+        renderInspectorRows();
+      }
+    });
+
+    socket.on('git-status', ({ id, snapshot }) => {
+      if (!id) return;
+      state.gitStatus.set(id, snapshot);
+      if (id === state.activeTabId) renderGitWidget();
+    });
+
+    socket.on('workspaces', (list) => {
+      state.workspaces = Array.isArray(list) ? list : [];
+      renderWorkspaceList();
+      renderWorkspaceControls();
+    });
+
+    socket.on('workspace-status', ({ id, instance, state: wsState }) => {
+      const idx = state.workspaces.findIndex((w) => w.id === id);
+      if (idx >= 0) {
+        state.workspaces[idx] = {
+          ...state.workspaces[idx],
+          status: {
+            state: wsState === 'stopped' ? 'stopped' : 'running',
+            ready: wsState === 'ready',
+            hostPort: instance ? instance.hostPort : null,
+            containerId: instance ? instance.containerId : null,
+            startedAt: instance ? instance.startedAt : null,
+          },
+        };
+        renderWorkspaceList();
+      }
+      if (state.activeWorkspaceId === id) {
+        renderWorkspaceControls();
+        // Auto-load the iframe as soon as the container reports ready.
+        if (wsState === 'ready') loadWorkspaceIframe(id);
+        if (wsState === 'stopped') clearWorkspaceIframe();
+      }
+    });
   }
 
   // Re-request context polling for every open tab after reconnect so the
@@ -1123,6 +1928,8 @@
       payload.command = data.get('command') || undefined;
       payload.args = data.get('args') || '';
       payload.cwd = data.get('cwd') || null;
+      const sp = data.get('servicePort');
+      if (sp) payload.servicePort = Number(sp);
     }
     try {
       await api('/api/admin/services', {
@@ -2211,6 +3018,394 @@
   window.addEventListener('resize', () => {
     const tab = activeTab();
     if (tab) fitTerminalFor(tab);
+  });
+
+  // ---------------------------------------------------------------------
+  //   Workspaces (graphical container streaming via KasmVNC/noVNC)
+  // ---------------------------------------------------------------------
+  function wsById(id) {
+    return state.workspaces.find((w) => w.id === id) || null;
+  }
+
+  function renderWorkspaceList() {
+    if (!els.workspaceList) return;
+    if (state.workspaces.length === 0) {
+      els.workspaceList.innerHTML =
+        '<li class="service-empty">No workspaces available. Ask an admin.</li>';
+      return;
+    }
+    els.workspaceList.innerHTML = '';
+    for (const w of state.workspaces) {
+      const li = document.createElement('li');
+      li.className = 'service-item workspace-item';
+      if (w.id === state.activeWorkspaceId) li.classList.add('active');
+
+      const dot = document.createElement('span');
+      const state_ = w.status && w.status.state;
+      dot.className = 'service-dot';
+      if (state_ === 'running') {
+        dot.classList.add(w.status.ready ? 'ready' : 'starting');
+      } else {
+        dot.classList.add('stopped');
+      }
+
+      const body = document.createElement('div');
+      body.className = 'service-body';
+      const name = document.createElement('div');
+      name.className = 'service-name';
+      name.textContent = w.name;
+      const badge = document.createElement('span');
+      badge.className = 'service-type-badge';
+      badge.textContent = 'ws';
+      name.appendChild(badge);
+
+      const sub = document.createElement('div');
+      sub.className = 'service-sub';
+      if (state_ === 'running') {
+        sub.textContent = w.status.ready ? 'running · ready' : 'starting…';
+      } else {
+        sub.textContent = w.image;
+      }
+
+      body.appendChild(name);
+      body.appendChild(sub);
+      li.appendChild(dot);
+      li.appendChild(body);
+      li.addEventListener('click', () => activateWorkspace(w.id));
+      els.workspaceList.appendChild(li);
+    }
+  }
+
+  async function activateWorkspace(id) {
+    const w = wsById(id);
+    if (!w) return;
+    // Leaving a shell tab? Blur it so the terminal stops receiving keystrokes.
+    state.activeTabId = null;
+    for (const t of state.tabs) t.hostEl.classList.remove('active');
+    els.tabBar.hidden = true;
+    els.placeholder.classList.add('hidden');
+    if (els.macroBar) els.macroBar.hidden = true;
+
+    state.activeWorkspaceId = id;
+    els.workspaceControls.hidden = false;
+    els.workspaceViewport.hidden = false;
+    renderWorkspaceList();
+    renderWorkspaceControls();
+    renderActiveHeader();
+
+    if (w.status && w.status.state === 'running' && w.status.ready) {
+      loadWorkspaceIframe(id);
+    } else if (w.status && w.status.state === 'running') {
+      showWorkspaceLoading('Waiting for container to become ready…');
+    } else {
+      showWorkspaceLoading('Starting workspace container…');
+      try {
+        await api(`/api/workspaces/${encodeURIComponent(id)}/start`, {
+          method: 'POST',
+        });
+      } catch (err) {
+        showWorkspaceLoading('Failed to start: ' + err.message);
+      }
+    }
+  }
+
+  function deactivateWorkspace() {
+    state.activeWorkspaceId = null;
+    els.workspaceControls.hidden = true;
+    els.workspaceViewport.hidden = true;
+    clearWorkspaceIframe();
+    renderWorkspaceList();
+  }
+
+  function renderWorkspaceControls() {
+    const w = state.activeWorkspaceId ? wsById(state.activeWorkspaceId) : null;
+    if (!w) return;
+    els.workspaceControlsName.textContent = w.name;
+    const running = w.status && w.status.state === 'running';
+    const ready = running && w.status.ready;
+    const statusText = ready ? 'ready' : running ? 'starting' : 'stopped';
+    els.workspaceControlsStatus.textContent = statusText;
+    els.workspaceControlsStatus.className =
+      'workspace-controls-status state-' + statusText;
+    els.workspaceStartBtn.hidden = running;
+    els.workspaceStopBtn.hidden = !running;
+    els.workspaceReloadBtn.disabled = !ready;
+    els.workspaceClipboardBtn.disabled = !ready;
+    els.workspaceFullscreenBtn.disabled = !ready;
+    // Update main header meta so users know they're on a workspace tab.
+    els.activeName.textContent = w.name;
+    els.activeMeta.textContent = `${w.image} · workspace · ${statusText}`;
+    setControlsEnabled({
+      start: false,
+      stop: false,
+      restart: false,
+      clear: false,
+      sftp: false,
+      logs: false,
+    });
+    els.sftpBtn.hidden = true;
+  }
+
+  function showWorkspaceLoading(text) {
+    els.workspaceLoading.hidden = false;
+    els.workspaceLoading.classList.remove('done');
+    els.workspaceLoadingText.textContent = text;
+    els.workspaceFrame.hidden = true;
+  }
+
+  function hideWorkspaceLoading() {
+    els.workspaceLoading.classList.add('done');
+    // Actually hide it after the fade so it stops blocking pointer events.
+    setTimeout(() => {
+      if (els.workspaceLoading.classList.contains('done')) {
+        els.workspaceLoading.hidden = true;
+      }
+    }, 260);
+  }
+
+  function clearWorkspaceIframe() {
+    els.workspaceFrame.hidden = true;
+    els.workspaceFrame.src = 'about:blank';
+    showWorkspaceLoading('Workspace stopped.');
+  }
+
+  async function loadWorkspaceIframe(id) {
+    const w = wsById(id);
+    if (!w) return;
+    let info = null;
+    try {
+      const body = await api(`/api/workspaces/${encodeURIComponent(id)}`);
+      info = body.instance;
+    } catch (err) {
+      showWorkspaceLoading('Unable to fetch workspace info: ' + err.message);
+      return;
+    }
+    if (!info) {
+      showWorkspaceLoading('Container is not running.');
+      return;
+    }
+    const params = new URLSearchParams();
+    if (state.workspaceView.autoConnect) {
+      params.set('autoconnect', '1');
+      // Both noVNC and KasmVNC accept `password` in the URL.
+      if (info.vncPassword) params.set('password', info.vncPassword);
+    }
+    if (state.workspaceView.resize) {
+      params.set('resize', 'remote');
+    }
+    // Rough quality mapping: KasmVNC honours these in its query string.
+    const qMap = { low: '3', medium: '6', high: '9' };
+    if (qMap[state.workspaceView.quality]) {
+      params.set('quality', qMap[state.workspaceView.quality]);
+    }
+    const url =
+      `/api/workspaces/${encodeURIComponent(id)}/stream/?` + params.toString();
+    els.workspaceFrame.hidden = false;
+    els.workspaceFrame.src = url;
+    els.workspaceFrame.onload = () => hideWorkspaceLoading();
+    // Safety net: some noVNC builds fire load only after the connection
+    // settles, so drop the overlay after a short delay too.
+    setTimeout(hideWorkspaceLoading, 1500);
+  }
+
+  els.workspaceStartBtn.addEventListener('click', () => {
+    if (state.activeWorkspaceId) activateWorkspace(state.activeWorkspaceId);
+  });
+
+  els.workspaceStopBtn.addEventListener('click', async () => {
+    if (!state.activeWorkspaceId) return;
+    const id = state.activeWorkspaceId;
+    try {
+      await api(`/api/workspaces/${encodeURIComponent(id)}/stop`, {
+        method: 'POST',
+      });
+    } catch (err) {
+      alert('Stop failed: ' + err.message);
+    }
+  });
+
+  els.workspaceReloadBtn.addEventListener('click', () => {
+    if (state.activeWorkspaceId) loadWorkspaceIframe(state.activeWorkspaceId);
+  });
+
+  els.workspaceFullscreenBtn.addEventListener('click', () => {
+    const target = els.workspaceViewport;
+    if (!target) return;
+    if (document.fullscreenElement) {
+      document.exitFullscreen().catch(() => {});
+    } else if (target.requestFullscreen) {
+      target.requestFullscreen().catch(() => {});
+    }
+  });
+
+  els.workspaceClipboardBtn.addEventListener('click', async () => {
+    if (!state.activeWorkspaceId) return;
+    try {
+      const body = await api(
+        `/api/workspaces/${encodeURIComponent(state.activeWorkspaceId)}`,
+      );
+      const pw = body.instance && body.instance.vncPassword;
+      if (!pw) return alert('Password not available yet.');
+      await navigator.clipboard.writeText(pw);
+      const btn = els.workspaceClipboardBtn;
+      const original = btn.textContent;
+      btn.textContent = 'Copied ✓';
+      setTimeout(() => (btn.textContent = original), 1400);
+    } catch (err) {
+      alert('Clipboard copy failed: ' + err.message);
+    }
+  });
+
+  els.workspaceAutoConnect.addEventListener('change', () => {
+    state.workspaceView.autoConnect = els.workspaceAutoConnect.checked;
+  });
+  els.workspaceResize.addEventListener('change', () => {
+    state.workspaceView.resize = els.workspaceResize.checked;
+  });
+  els.workspaceQuality.addEventListener('change', () => {
+    state.workspaceView.quality = els.workspaceQuality.value;
+  });
+
+  els.workspacesRefresh.addEventListener('click', async () => {
+    try {
+      const body = await api('/api/workspaces');
+      state.workspaces = body.workspaces || [];
+      renderWorkspaceList();
+      renderWorkspaceControls();
+    } catch (err) {
+      console.error('workspace refresh failed', err);
+    }
+  });
+
+  // ---------------------------------------------------------------------
+  //   Admin: workspace templates
+  // ---------------------------------------------------------------------
+  async function refreshAdminWorkspaces() {
+    if (!els.adminWorkspaceList) return;
+    try {
+      const { workspaces: list } = await api('/api/admin/workspaces');
+      renderAdminWorkspaces(list);
+    } catch (err) {
+      els.adminWorkspaceList.innerHTML = `<li class="service-empty">${err.message}</li>`;
+    }
+  }
+
+  function renderAdminWorkspaces(list) {
+    if (!list.length) {
+      els.adminWorkspaceList.innerHTML =
+        '<li class="service-empty">No workspaces yet. Add one on the right.</li>';
+      return;
+    }
+    els.adminWorkspaceList.innerHTML = '';
+    for (const w of list) {
+      const li = document.createElement('li');
+      const body = document.createElement('div');
+      body.className = 'row-body';
+      const allowed =
+        w.allowedUsers && w.allowedUsers.length
+          ? ' · allowed: ' + w.allowedUsers.join(', ')
+          : ' · admins only';
+      body.innerHTML = `
+        <div class="row-name">${escapeHtml(w.name)}</div>
+        <div class="row-sub">${escapeHtml(
+          `${w.image} · ${w.resolution} · shm=${w.shmSize}` + allowed,
+        )}</div>`;
+      const actions = document.createElement('div');
+      actions.className = 'row-actions';
+      const del = document.createElement('button');
+      del.className = 'icon-btn';
+      del.title = 'Delete workspace';
+      del.textContent = '🗑';
+      del.addEventListener('click', async () => {
+        if (!confirm(`Delete workspace "${w.name}"?`)) return;
+        try {
+          await api(`/api/admin/workspaces/${w.id}`, { method: 'DELETE' });
+          refreshAdminWorkspaces();
+        } catch (err) {
+          alert(err.message);
+        }
+      });
+      actions.appendChild(del);
+      li.appendChild(body);
+      li.appendChild(actions);
+      els.adminWorkspaceList.appendChild(li);
+    }
+  }
+
+  function renderWorkspaceAllowedUsersPicker() {
+    if (!els.workspaceAllowedUsers) return;
+    const nonAdmins = state.users.filter((u) => u.role !== 'admin');
+    if (nonAdmins.length === 0) {
+      els.workspaceAllowedUsers.innerHTML =
+        '<span class="service-empty">Create non-admin users first to grant them access.</span>';
+      return;
+    }
+    els.workspaceAllowedUsers.innerHTML = '';
+    for (const u of nonAdmins) {
+      const label = document.createElement('label');
+      const input = document.createElement('input');
+      input.type = 'checkbox';
+      input.name = 'wsAllowedUser';
+      input.value = u.username;
+      label.appendChild(input);
+      label.appendChild(document.createTextNode(u.username));
+      els.workspaceAllowedUsers.appendChild(label);
+    }
+  }
+
+  if (els.adminWorkspaceForm) {
+    els.adminWorkspaceForm.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const err = $('[data-error]', els.adminWorkspaceForm);
+      clearError(err);
+      const data = new FormData(els.adminWorkspaceForm);
+      const allowedUsers = $$(
+        'input[name="wsAllowedUser"]:checked',
+        els.adminWorkspaceForm,
+      ).map((el) => el.value);
+      const payload = {
+        name: data.get('name'),
+        image: data.get('image'),
+        description: data.get('description') || '',
+        internalPort: Number(data.get('internalPort')) || 6901,
+        resolution: data.get('resolution') || '1280x800',
+        shmSize: data.get('shmSize') || '512m',
+        useHttps: !!data.get('useHttps'),
+        allowedUsers,
+      };
+      try {
+        await api('/api/admin/workspaces', {
+          method: 'POST',
+          body: JSON.stringify(payload),
+        });
+        els.adminWorkspaceForm.reset();
+        // Restore the useHttps default checkbox state after reset.
+        const httpsBox = els.adminWorkspaceForm.querySelector(
+          'input[name="useHttps"]',
+        );
+        if (httpsBox) httpsBox.checked = true;
+        refreshAdminWorkspaces();
+      } catch (e) {
+        showError(err, e.message);
+      }
+    });
+  }
+
+  // Refresh admin workspace UI whenever the admin modal opens. Piggyback on
+  // the existing admin-btn handler by observing tab clicks.
+  $$('.tab', els.adminModal).forEach((tab) => {
+    if (tab.dataset.tab === 'workspaces') {
+      tab.addEventListener('click', () => {
+        refreshAdminWorkspaces();
+        renderWorkspaceAllowedUsersPicker();
+      });
+    }
+  });
+  // Also refresh when the admin panel opens (the initial refreshAdminUsers
+  // populates state.users, which the picker depends on).
+  els.adminBtn.addEventListener('click', () => {
+    setTimeout(renderWorkspaceAllowedUsersPicker, 0);
+    setTimeout(refreshAdminWorkspaces, 0);
   });
 
   bootstrap();

@@ -12,8 +12,19 @@ const Busboy = require('busboy');
 const { Server: SocketIOServer } = require('socket.io');
 
 const TaskManager = require('./TaskManager');
+const WorkspaceManager = require('./WorkspaceManager');
 const ResourceMonitor = require('./ResourceMonitor');
 const LogWatcher = require('./LogWatcher');
+const TunnelManager = require('./TunnelManager');
+const HttpInspector = require('./HttpInspector');
+const { GitWatcher, ACTIONS: GIT_ACTIONS } = require('./GitWatcher');
+const { checkPort, killPid } = require('./portInspector');
+const {
+  proxyHttp: proxyVncHttp,
+  proxyWebSocket: proxyVncWebSocket,
+  parseWorkspaceProxyPath,
+} = require('./vncProxy');
+const { reapOrphanedWorkspaces } = require('./sessions/WorkspaceSession');
 const {
   UserStore,
   createSessionMiddleware,
@@ -118,6 +129,22 @@ const manager = new TaskManager({
 });
 
 const watcher = new LogWatcher();
+const tunnels = new TunnelManager();
+const inspectors = new HttpInspector();
+const gitWatcher = new GitWatcher({
+  resolveCwd: (id) => {
+    const entry = manager.services.get(id);
+    if (!entry) return null;
+    const def = entry.definition;
+    // Git is only meaningful when there's a local filesystem path we can shell
+    // into. SSH and docker services would need remote git, which is out of
+    // scope here.
+    if (def.type !== 'local') return null;
+    // Mirror LocalSession's fallback so a service with no explicit cwd still
+    // reports git status for the directory the shell actually opens in.
+    return def.cwd || process.env.HOME || process.cwd();
+  },
+});
 
 for (const def of loadServicesFromDisk()) {
   try {
@@ -149,14 +176,94 @@ manager.on('data', (id, chunk) => {
   }
 });
 
+const workspaces = new WorkspaceManager();
+
 const sessionMiddleware = createSessionMiddleware(SESSION_SECRET);
 
 app.use(cors({ origin: true, credentials: true }));
-app.use(express.json({ limit: '2mb' })); // room for pasted SSH keys
 app.use(sessionMiddleware);
+// Workspace stream proxy MUST be mounted before express.json so request
+// bodies (uploads, form posts inside the noVNC UI) reach the container
+// unread. Its handler always terminates the request, never calls next().
+app.use('/api/workspaces/:id/stream', workspaceStreamHandler);
+app.use(express.json({ limit: '2mb' })); // room for pasted SSH keys
 app.use(express.static(PUBLIC_DIR));
 
 io.engine.use(sessionMiddleware);
+
+// Intercept WebSocket upgrades destined for the workspace proxy before
+// Socket.IO's default handler sees them. Everything else falls through to the
+// listeners Socket.IO registered on the HTTP server.
+(function installWorkspaceUpgradeDispatcher() {
+  const priorListeners = server.listeners('upgrade').slice();
+  server.removeAllListeners('upgrade');
+  server.on('upgrade', (req, socket, head) => {
+    const wsPath = parseWorkspaceProxyPath(req.url || '');
+    if (!wsPath) {
+      for (const l of priorListeners) l.call(server, req, socket, head);
+      return;
+    }
+    // Populate req.session via the express-session middleware. It only writes
+    // to the response on session creation, which won't happen here — the
+    // request already carries a valid cookie or we reject it.
+    const dummyRes = new http.ServerResponse(req);
+    dummyRes.assignSocket(socket);
+    sessionMiddleware(req, dummyRes, () => {
+      const user = req.session && req.session.user;
+      if (!user || !workspaces.userCanAccess(user, wsPath.id)) {
+        socket.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n');
+        socket.destroy();
+        return;
+      }
+      const inst = workspaces.getInstance(wsPath.id);
+      if (!inst) {
+        socket.write('HTTP/1.1 409 Conflict\r\nConnection: close\r\n\r\n');
+        socket.destroy();
+        return;
+      }
+      // Detach the socket from the ServerResponse before piping — otherwise
+      // Node will try to write status lines to a socket we've handed off.
+      try {
+        dummyRes.detachSocket(socket);
+      } catch {
+        /* older Node builds silently no-op */
+      }
+      proxyVncWebSocket(
+        { hostPort: inst.session.hostPort, useHttps: inst.session.useHttps },
+        req,
+        socket,
+        head,
+        wsPath.remainder,
+      );
+    });
+  });
+})();
+
+function workspaceStreamHandler(req, res) {
+  const user = currentUser(req);
+  if (!user) {
+    res.status(401).json({ error: 'authentication required' });
+    return;
+  }
+  const id = req.params.id;
+  if (!workspaces.userCanAccess(user, id)) {
+    res.status(404).json({ error: 'workspace not found' });
+    return;
+  }
+  const inst = workspaces.getInstance(id);
+  if (!inst) {
+    res.status(409).json({ error: 'workspace is not running' });
+    return;
+  }
+  // req.url is already relative to the mount point (`/api/workspaces/:id/stream`).
+  const remainder = req.url || '/';
+  proxyVncHttp(
+    { hostPort: inst.session.hostPort, useHttps: inst.session.useHttps },
+    req,
+    res,
+    remainder,
+  );
+}
 
 // ---------- Auth REST ----------
 
@@ -228,7 +335,25 @@ app.get('/api/services/:id', requireAuth, requireCanAccessService, (req, res) =>
   res.json(manager.getService(req.params.id));
 });
 
-app.post('/api/services/:id/start', requireAuth, requireCanAccessService, (req, res) => {
+app.post('/api/services/:id/start', requireAuth, requireCanAccessService, async (req, res) => {
+  const entry = manager.services.get(req.params.id);
+  const port = entry && entry.definition.servicePort;
+  const force = !!(req.body && req.body.force);
+  if (port && !force) {
+    try {
+      const check = await checkPort(port);
+      if (check.inUse) {
+        return res.status(409).json({
+          error: `port ${port} is already in use`,
+          conflict: { ...check, servicePort: port },
+        });
+      }
+    } catch (err) {
+      // Detection failed (e.g. lsof missing) — fall through and let the
+      // service try to start. Better to attempt than to block.
+      console.warn(`[shellHelper] port pre-flight failed: ${err.message}`);
+    }
+  }
   try {
     const status = manager.startService(req.params.id, req.body || {});
     res.json({ id: req.params.id, status });
@@ -266,8 +391,292 @@ app.post(
   },
 );
 
+// ---------- Ephemeral public tunnels (cloudflared) ----------
+
+app.get(
+  '/api/services/:id/tunnel/status',
+  requireAuth,
+  requireCanAccessService,
+  (req, res) => {
+    res.json(tunnels.status(req.params.id));
+  },
+);
+
+app.post(
+  '/api/services/:id/tunnel/start',
+  requireAuth,
+  requireCanAccessService,
+  async (req, res) => {
+    const port = Number((req.body && req.body.port) || 0);
+    try {
+      const url = await tunnels.start(req.params.id, port);
+      res.json({ ok: true, url, ...tunnels.status(req.params.id) });
+    } catch (err) {
+      res.status(400).json({ error: err.message });
+    }
+  },
+);
+
+app.post(
+  '/api/services/:id/tunnel/stop',
+  requireAuth,
+  requireCanAccessService,
+  (req, res) => {
+    const stopped = tunnels.stop(req.params.id);
+    res.json({ ok: true, stopped });
+  },
+);
+
+// ---------- Port inspector + kill ----------
+
+app.get('/api/tools/check-port', requireAuth, async (req, res) => {
+  try {
+    const info = await checkPort(req.query.port);
+    res.json(info);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// Killing arbitrary host pids is admin-only. `requireCanAccessService` isn't
+// enough because the offending pid is by definition not one of ours.
+app.post('/api/tools/kill-pid', requireAdmin, async (req, res) => {
+  const { pid, signal } = req.body || {};
+  try {
+    const info = await killPid(pid, signal ? { signal } : {});
+    res.json({ ok: true, ...info });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// Kill whoever is squatting on the service's configured port. Access is gated
+// on the service (owner or admin), which is the closest we can get to a per-
+// service authorisation for terminating an unrelated host process — because
+// the service owner is who's trying to start it, we accept that they get to
+// nuke a blocker on their own port.
+app.post(
+  '/api/services/:id/kill-blocker',
+  requireAuth,
+  requireCanAccessService,
+  async (req, res) => {
+    const entry = manager.services.get(req.params.id);
+    if (!entry) return res.status(404).json({ error: 'service not found' });
+    const port = entry.definition.servicePort;
+    if (!port) return res.status(400).json({ error: 'service has no port configured' });
+    try {
+      const check = await checkPort(port);
+      if (!check.inUse || !check.pid) {
+        return res.json({ ok: true, killed: false, message: 'port already free' });
+      }
+      // Refuse to shoot the panel in the foot.
+      if (check.pid === process.pid) {
+        return res.status(400).json({ error: 'that PID is the shellHelper panel itself' });
+      }
+      const info = await killPid(check.pid);
+      res.json({ ok: true, killed: true, ...info, port });
+    } catch (err) {
+      res.status(400).json({ error: err.message });
+    }
+  },
+);
+
+// ---------- HTTP inspector (per-service proxy tap) ----------
+
+app.get(
+  '/api/services/:id/inspector/status',
+  requireAuth,
+  requireCanAccessService,
+  (req, res) => {
+    res.json(inspectors.status(req.params.id));
+  },
+);
+
+app.get(
+  '/api/services/:id/inspector/history',
+  requireAuth,
+  requireCanAccessService,
+  (req, res) => {
+    res.json({ history: inspectors.history(req.params.id) });
+  },
+);
+
+app.post(
+  '/api/services/:id/inspector/start',
+  requireAuth,
+  requireCanAccessService,
+  async (req, res) => {
+    const entry = manager.services.get(req.params.id);
+    const targetPort =
+      (req.body && Number(req.body.targetPort)) ||
+      (entry && entry.definition.servicePort) ||
+      0;
+    const listenPort = req.body && req.body.listenPort;
+    try {
+      const status = await inspectors.start(req.params.id, {
+        targetPort,
+        listenPort,
+      });
+      res.json({ ok: true, ...status });
+    } catch (err) {
+      res.status(400).json({ error: err.message });
+    }
+  },
+);
+
+app.post(
+  '/api/services/:id/inspector/stop',
+  requireAuth,
+  requireCanAccessService,
+  (req, res) => {
+    inspectors.stop(req.params.id);
+    res.json({ ok: true });
+  },
+);
+
+app.post(
+  '/api/services/:id/inspector/clear',
+  requireAuth,
+  requireCanAccessService,
+  (req, res) => {
+    inspectors.clearHistory(req.params.id);
+    res.json({ ok: true });
+  },
+);
+
+// ---------- Git status ----------
+
+app.get(
+  '/api/services/:id/git',
+  requireAuth,
+  requireCanAccessService,
+  async (req, res) => {
+    try {
+      const snap = await gitWatcher.refresh(req.params.id);
+      res.json(snap);
+    } catch (err) {
+      res.status(400).json({ error: err.message });
+    }
+  },
+);
+
+app.post(
+  '/api/services/:id/git/:action',
+  requireAuth,
+  requireCanAccessService,
+  async (req, res) => {
+    const action = req.params.action;
+    if (!GIT_ACTIONS.includes(action)) {
+      return res.status(400).json({ error: 'unknown git action' });
+    }
+    try {
+      const result = await gitWatcher.runAction(req.params.id, action);
+      res.json(result);
+    } catch (err) {
+      res.status(400).json({ error: err.message });
+    }
+  },
+);
+
 app.get('/api/metrics/host', requireAuth, (_req, res) => {
   res.json({ host: monitor.getLastHost() });
+});
+
+// ---------- Workspaces (graphical container streaming) ----------
+
+app.get('/api/workspaces', requireAuth, (req, res) => {
+  res.json({ workspaces: workspaces.listTemplatesForUser(currentUser(req)) });
+});
+
+function requireCanAccessWorkspace(req, res, next) {
+  const user = currentUser(req);
+  if (!workspaces.userCanAccess(user, req.params.id)) {
+    return res.status(404).json({ error: 'workspace not found' });
+  }
+  next();
+}
+
+app.get(
+  '/api/workspaces/:id',
+  requireAuth,
+  requireCanAccessWorkspace,
+  (req, res) => {
+    const template = workspaces.getTemplateForUser(
+      req.params.id,
+      currentUser(req),
+    );
+    if (!template) return res.status(404).json({ error: 'workspace not found' });
+    // Include the vncPassword only when the caller owns/has access and the
+    // instance is live — the frontend needs it to build the noVNC URL.
+    const info = workspaces.instanceInfo(req.params.id);
+    res.json({ workspace: template, instance: info });
+  },
+);
+
+app.post(
+  '/api/workspaces/:id/start',
+  requireAuth,
+  requireCanAccessWorkspace,
+  async (req, res) => {
+    try {
+      const info = await workspaces.startInstance(req.params.id);
+      broadcastWorkspaceList();
+      res.json({ id: req.params.id, instance: info });
+    } catch (err) {
+      res.status(400).json({ error: err.message });
+    }
+  },
+);
+
+app.post(
+  '/api/workspaces/:id/stop',
+  requireAuth,
+  requireCanAccessWorkspace,
+  async (req, res) => {
+    try {
+      await workspaces.stopInstance(req.params.id);
+      broadcastWorkspaceList();
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(400).json({ error: err.message });
+    }
+  },
+);
+
+// ---------- Admin: workspaces ----------
+
+app.get('/api/admin/workspaces', requireAdmin, (_req, res) => {
+  res.json({ workspaces: workspaces.listTemplates() });
+});
+
+app.post('/api/admin/workspaces', requireAdmin, (req, res) => {
+  try {
+    const created = workspaces.createTemplate(req.body || {});
+    broadcastWorkspaceList();
+    res.status(201).json({ workspace: created });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+app.patch('/api/admin/workspaces/:id', requireAdmin, (req, res) => {
+  try {
+    const updated = workspaces.updateTemplate(req.params.id, req.body || {});
+    broadcastWorkspaceList();
+    res.json({ workspace: updated });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+app.delete('/api/admin/workspaces/:id', requireAdmin, async (req, res) => {
+  try {
+    await workspaces.deleteTemplate(req.params.id);
+    broadcastWorkspaceList();
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
 });
 
 // ---------- Ephemeral scratchpad sessions ----------
@@ -656,6 +1065,7 @@ function normalizeIncomingService(input, existing) {
     delete merged.command;
     delete merged.args;
     delete merged.cwd;
+    delete merged.servicePort;
   } else if (merged.type === 'docker') {
     if (!merged.containerId) throw new Error('docker containerId is required');
     merged.containerId = String(merged.containerId).trim();
@@ -673,6 +1083,7 @@ function normalizeIncomingService(input, existing) {
     // Strip fields from other transport types.
     delete merged.host;
     delete merged.port;
+    delete merged.servicePort;
     delete merged.sshUser;
     delete merged.sshPassword;
     delete merged.sshPasswordEncrypted;
@@ -690,6 +1101,17 @@ function normalizeIncomingService(input, existing) {
     }
     merged.args = Array.isArray(merged.args) ? merged.args : [];
     if (!merged.cwd) merged.cwd = null;
+    // Optional listening port — enables the port-conflict pre-flight and
+    // gives the HTTP inspector a sensible default target.
+    if (input && (input.servicePort === '' || input.servicePort == null)) {
+      delete merged.servicePort;
+    } else if (input && input.servicePort != null) {
+      const sp = Number(input.servicePort);
+      if (!Number.isInteger(sp) || sp < 1 || sp > 65535) {
+        throw new Error('servicePort must be an integer between 1 and 65535');
+      }
+      merged.servicePort = sp;
+    }
     delete merged.host;
     delete merged.port;
     delete merged.sshUser;
@@ -744,6 +1166,8 @@ app.delete('/api/admin/services/:id', requireAdmin, (req, res) => {
   if (!manager.services.has(req.params.id)) {
     return res.status(404).json({ error: 'service not found' });
   }
+  tunnels.stop(req.params.id);
+  inspectors.stop(req.params.id);
   manager.removeService(req.params.id);
   watcher.removeService(req.params.id);
   saveServicesToDisk(manager.persistentDefinitions());
@@ -808,6 +1232,14 @@ function broadcastServiceList() {
   }
 }
 
+function broadcastWorkspaceList() {
+  for (const socket of io.sockets.sockets.values()) {
+    const user = socketUser(socket);
+    if (!user) continue;
+    socket.emit('workspaces', workspaces.listTemplatesForUser(user));
+  }
+}
+
 manager.on('data', (id, chunk) => {
   io.to(roomFor(id)).emit('service-output', { id, data: chunk });
 });
@@ -824,10 +1256,50 @@ manager.on('error', (id, err) => {
   io.to(roomFor(id)).emit('service-error', { id, message: err.message });
 });
 
+// A tunnel or inspector points at a port opened by a service. If the service
+// exits, the port is gone — tear them down so we don't leave stale state
+// hanging in the UI. restartService goes through stop → start, so this
+// covers restarts too.
+manager.on('exit', (id) => {
+  if (tunnels.isActive(id)) tunnels.stop(id);
+  if (inspectors.isActive(id)) inspectors.stop(id);
+});
+
+tunnels.on('status', (id, status) => {
+  io.to(roomFor(id)).emit('tunnel-status', { id, ...status });
+});
+tunnels.on('stopped', (id, info) => {
+  io.to(roomFor(id)).emit('tunnel-status', {
+    id,
+    active: false,
+    url: null,
+    ...info,
+  });
+});
+tunnels.on('error', (id, err) => {
+  io.to(roomFor(id)).emit('tunnel-error', { id, message: err.message });
+});
+
+inspectors.on('status', (id, status) => {
+  io.to(roomFor(id)).emit('inspector-status', { id, ...status });
+});
+inspectors.on('capture', (id, record) => {
+  io.to(roomFor(id)).emit('http-capture', { id, record });
+});
+inspectors.on('cleared', (id) => {
+  io.to(roomFor(id)).emit('inspector-cleared', { id });
+});
+
+gitWatcher.on('status', (id, snapshot) => {
+  io.to(roomFor(id)).emit('git-status', { id, snapshot });
+});
+
 // Ephemeral scratchpads self-destruct on shell exit — surface that to viewers
 // and also tear down the backing container so the FS is wiped.
 manager.on('removed', (id) => {
   io.to(roomFor(id)).emit('service-removed', { id });
+  if (tunnels.isActive(id)) tunnels.stop(id);
+  if (inspectors.isActive(id)) inspectors.stop(id);
   const container = scratchpadContainers.get(id);
   if (container) {
     scratchpadContainers.delete(id);
@@ -860,6 +1332,19 @@ watcher.on('alert', (alert) => {
   io.to(roomFor(alert.serviceId)).emit('log-alert', alert);
 });
 
+workspaces.on('started', ({ id, info }) => {
+  broadcastWorkspaceList();
+  io.emit('workspace-status', { id, instance: info, state: 'starting' });
+});
+workspaces.on('ready', ({ id, info }) => {
+  broadcastWorkspaceList();
+  io.emit('workspace-status', { id, instance: info, state: 'ready' });
+});
+workspaces.on('exit', ({ id }) => {
+  broadcastWorkspaceList();
+  io.emit('workspace-status', { id, instance: null, state: 'stopped' });
+});
+
 io.on('connection', (socket) => {
   const user = socketUser(socket);
   if (!user) {
@@ -869,6 +1354,7 @@ io.on('connection', (socket) => {
   }
 
   socket.emit('services', manager.listServicesForUser(user));
+  socket.emit('workspaces', workspaces.listTemplatesForUser(user));
   const lastHost = monitor.getLastHost();
   if (lastHost) socket.emit('host-metrics', lastHost);
 
@@ -890,6 +1376,10 @@ io.on('connection', (socket) => {
     const scrollback = manager.getScrollback(id);
     if (scrollback) socket.emit('service-output', { id, data: scrollback });
     socket.emit('service-status', manager.getService(id));
+    socket.emit('tunnel-status', { id, ...tunnels.status(id) });
+    socket.emit('inspector-status', { id, ...inspectors.status(id) });
+    const cachedGit = gitWatcher.latest(id);
+    if (cachedGit) socket.emit('git-status', { id, snapshot: cachedGit });
     if (typeof ack === 'function') ack({ ok: true });
   });
 
@@ -907,6 +1397,28 @@ io.on('connection', (socket) => {
 
   socket.data = socket.data || {};
   socket.data.contexts = new Set();
+  socket.data.gitWatched = new Set();
+
+  socket.on('watch-git', ({ id } = {}, ack) => {
+    if (!manager.userCanAccess(user, id)) {
+      if (typeof ack === 'function') ack({ ok: false, error: 'access denied' });
+      return;
+    }
+    if (socket.data.gitWatched.has(id)) {
+      if (typeof ack === 'function') ack({ ok: true });
+      return;
+    }
+    socket.data.gitWatched.add(id);
+    gitWatcher.watch(id);
+    if (typeof ack === 'function') ack({ ok: true });
+  });
+
+  socket.on('unwatch-git', ({ id } = {}) => {
+    if (id && socket.data.gitWatched.has(id)) {
+      socket.data.gitWatched.delete(id);
+      gitWatcher.unwatch(id);
+    }
+  });
 
   socket.on('watch-context', ({ id } = {}, ack) => {
     if (!manager.userCanAccess(user, id)) {
@@ -945,10 +1457,14 @@ io.on('connection', (socket) => {
   });
 
   socket.on('disconnect', () => {
-    // Release every context watch this socket was holding.
+    // Release every context / git watch this socket was holding.
     if (socket.data && socket.data.contexts) {
       for (const id of socket.data.contexts) monitor.unwatchContext(id);
       socket.data.contexts.clear();
+    }
+    if (socket.data && socket.data.gitWatched) {
+      for (const id of socket.data.gitWatched) gitWatcher.unwatch(id);
+      socket.data.gitWatched.clear();
     }
   });
 
@@ -1007,12 +1523,18 @@ io.on('connection', (socket) => {
 function shutdown(signal) {
   console.log(`[shellHelper] received ${signal}, shutting down...`);
   monitor.stop();
+  tunnels.shutdown();
+  inspectors.shutdown();
+  gitWatcher.stopAll();
   manager.shutdown();
   // Tear down any live scratchpad containers; don't block exit on it.
   for (const [id, { docker, containerId }] of scratchpadContainers) {
     destroyScratchpadContainer(docker, containerId).catch(() => {});
     scratchpadContainers.delete(id);
   }
+  // Stop any running workspace containers too. Fire-and-forget: exit still
+  // proceeds in 5s even if Docker is unresponsive.
+  workspaces.shutdown().catch(() => {});
   io.close();
   server.close(() => process.exit(0));
   setTimeout(() => process.exit(1), 5_000).unref();
@@ -1026,4 +1548,5 @@ server.listen(PORT, HOST, () => {
   // Sweep any scratchpad containers left behind by a previous run (crash,
   // kill -9, etc.). Best-effort — silently no-ops if Docker isn't around.
   reapOrphanedScratchpads().catch(() => {});
+  reapOrphanedWorkspaces().catch(() => {});
 });

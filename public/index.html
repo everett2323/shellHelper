@@ -74,6 +74,18 @@
           </ul>
         </section>
 
+        <section class="sidebar-section sidebar-section-workspaces">
+          <div class="section-heading">
+            <span>Workspaces</span>
+            <button id="workspaces-refresh-btn" class="ghost-btn" title="Refresh workspaces">
+              ↻
+            </button>
+          </div>
+          <ul id="workspace-list" class="service-list workspace-list">
+            <li class="service-empty">No workspaces defined.</li>
+          </ul>
+        </section>
+
         <footer class="sidebar-footer">
           <div class="metrics-panel">
             <div class="metrics-heading">
@@ -147,6 +159,25 @@
             </div>
           </div>
           <div class="controls">
+            <div id="git-widget" class="git-widget" hidden title="Git status of this service's working directory">
+              <span class="git-widget-icon" aria-hidden="true">⎇</span>
+              <span id="git-widget-branch" class="git-widget-branch">—</span>
+              <span id="git-widget-track" class="git-widget-track"></span>
+              <span id="git-widget-dirty" class="git-widget-dirty"></span>
+              <div class="git-widget-actions">
+                <button id="git-pull-btn" class="git-action-btn" type="button" title="git pull --ff-only">Pull</button>
+                <button id="git-stash-btn" class="git-action-btn" type="button" title="git stash push -u">Stash</button>
+                <button id="git-fetch-btn" class="git-action-btn" type="button" title="git fetch --all --prune">Fetch</button>
+              </div>
+            </div>
+            <button id="inspector-btn" class="btn btn-inspector" disabled hidden title="Live HTTP request inspector (proxy tap)">
+              <span class="tunnel-icon" aria-hidden="true">⧉</span>
+              <span class="inspector-label">HTTP Traffic</span>
+            </button>
+            <button id="tunnel-btn" class="btn btn-tunnel" disabled title="Expose a local port on this service to the public internet via a Cloudflare Quick Tunnel">
+              <span class="tunnel-icon" aria-hidden="true">◈</span>
+              <span class="tunnel-label">Public Tunnel</span>
+            </button>
             <button id="sftp-btn" class="btn btn-ghost" disabled hidden>Files</button>
             <button id="logs-btn" class="btn btn-ghost" disabled>Logs</button>
             <button id="start-btn" class="btn btn-start" disabled>Start</button>
@@ -156,12 +187,73 @@
           </div>
         </header>
 
+        <div id="tunnel-bar" class="tunnel-bar" hidden>
+          <span class="tunnel-status-dot"></span>
+          <span class="tunnel-bar-label">Public tunnel</span>
+          <a id="tunnel-url" class="tunnel-url" href="#" target="_blank" rel="noopener noreferrer">—</a>
+          <span id="tunnel-port" class="tunnel-port"></span>
+          <div class="tunnel-bar-spacer"></div>
+          <button id="tunnel-copy-btn" class="btn btn-ghost" type="button" title="Copy URL to clipboard">
+            <span id="tunnel-copy-label">Copy</span>
+          </button>
+          <button id="tunnel-disconnect-btn" class="btn btn-stop" type="button" title="Disconnect the public tunnel">
+            Disconnect
+          </button>
+        </div>
+
         <div id="tab-bar" class="tab-bar" hidden></div>
 
         <div id="macro-bar" class="macro-bar" hidden></div>
 
+        <div id="workspace-controls" class="workspace-controls" hidden>
+          <span id="workspace-controls-name" class="workspace-controls-name">Workspace</span>
+          <span id="workspace-controls-status" class="workspace-controls-status">stopped</span>
+          <div class="workspace-controls-spacer"></div>
+          <label class="workspace-toggle" title="Auto-connect passing the ephemeral password">
+            <input type="checkbox" id="workspace-autoconnect" checked />
+            <span>Auto-connect</span>
+          </label>
+          <label class="workspace-toggle" title="Fit the remote desktop to this window">
+            <input type="checkbox" id="workspace-resize" checked />
+            <span>Fit window</span>
+          </label>
+          <label class="workspace-select" title="Reload with a different quality preset">
+            <span>Quality</span>
+            <select id="workspace-quality">
+              <option value="high">High</option>
+              <option value="medium" selected>Medium</option>
+              <option value="low">Low</option>
+            </select>
+          </label>
+          <button id="workspace-clipboard-btn" class="btn btn-ghost" title="Copy the ephemeral VNC password to your clipboard">
+            Copy password
+          </button>
+          <button id="workspace-reload-btn" class="btn btn-ghost" title="Reload the viewer with current settings">
+            Reload viewer
+          </button>
+          <button id="workspace-fullscreen-btn" class="btn btn-ghost" title="Toggle fullscreen">
+            ⛶ Fullscreen
+          </button>
+          <button id="workspace-start-btn" class="btn btn-start" hidden>Start container</button>
+          <button id="workspace-stop-btn" class="btn btn-stop" hidden>Stop container</button>
+        </div>
+
         <section class="terminal-wrapper">
           <div id="terminals-container" class="terminals-container"></div>
+          <div id="workspace-viewport" class="workspace-viewport" hidden>
+            <div id="workspace-loading" class="workspace-loading">
+              <div class="placeholder-mark">◈</div>
+              <p id="workspace-loading-text">Provisioning workspace container…</p>
+            </div>
+            <iframe
+              id="workspace-frame"
+              class="workspace-frame"
+              title="Workspace stream"
+              allow="clipboard-read; clipboard-write; fullscreen; autoplay"
+              allowfullscreen
+              hidden
+            ></iframe>
+          </div>
           <div id="terminal-placeholder" class="terminal-placeholder">
             <div>
               <div class="placeholder-mark">▍</div>
@@ -184,6 +276,7 @@
         <nav class="tabs">
           <button class="tab active" data-tab="users">Users</button>
           <button class="tab" data-tab="shells">Shells</button>
+          <button class="tab" data-tab="workspaces">Workspaces</button>
           <button class="tab" data-tab="hosts">Known SSH hosts</button>
         </nav>
 
@@ -259,6 +352,16 @@
                   <label>
                     <span>Working directory</span>
                     <input name="cwd" placeholder="(defaults to $HOME)" />
+                  </label>
+                  <label>
+                    <span>Listening port (optional)</span>
+                    <input
+                      name="servicePort"
+                      type="number"
+                      min="1"
+                      max="65535"
+                      placeholder="e.g. 3000 — enables port conflict detection & HTTP inspector"
+                    />
                   </label>
                 </div>
 
@@ -355,6 +458,79 @@
                 </fieldset>
 
                 <button type="submit" class="btn btn-primary">Add shell</button>
+                <p class="form-error" data-error hidden></p>
+              </form>
+            </div>
+          </div>
+        </div>
+
+        <div class="tab-panel" data-panel="workspaces" hidden>
+          <div class="panel-cols">
+            <div>
+              <h3>Existing workspaces</h3>
+              <ul id="admin-workspace-list" class="admin-list">
+                <li class="service-empty">Loading…</li>
+              </ul>
+              <p class="help-text">
+                Workspaces spin up a graphical container (KasmVNC / noVNC) on
+                demand and stream it into a browser tab. They stop
+                automatically after 30 minutes idle.
+              </p>
+            </div>
+            <div>
+              <h3>Add workspace</h3>
+              <form id="admin-workspace-form" class="form-stack">
+                <label>
+                  <span>Display name</span>
+                  <input name="name" required placeholder="Chrome desktop" />
+                </label>
+                <label>
+                  <span>Docker image</span>
+                  <input
+                    name="image"
+                    required
+                    placeholder="kasmweb/chrome:1.15.0"
+                  />
+                </label>
+                <label>
+                  <span>Description (optional)</span>
+                  <input
+                    name="description"
+                    placeholder="Sandboxed Chromium for OSINT lookups"
+                  />
+                </label>
+                <label>
+                  <span>Internal web-VNC port</span>
+                  <input
+                    name="internalPort"
+                    type="number"
+                    min="1"
+                    max="65535"
+                    value="6901"
+                  />
+                </label>
+                <label>
+                  <span>Resolution</span>
+                  <input name="resolution" value="1280x800" />
+                </label>
+                <label>
+                  <span>Shared memory (--shm-size)</span>
+                  <input name="shmSize" value="512m" />
+                </label>
+                <label class="checkbox-row">
+                  <input type="checkbox" name="useHttps" checked />
+                  <span>
+                    Backend serves HTTPS (kasmweb/* images default to yes;
+                    uncheck for linuxserver/* HTTP-only images)
+                  </span>
+                </label>
+                <fieldset class="allowed-users">
+                  <legend>Allowed users (besides admins)</legend>
+                  <div id="workspace-allowed-users" class="checkbox-grid">
+                    <span class="service-empty">Loading users…</span>
+                  </div>
+                </fieldset>
+                <button type="submit" class="btn btn-primary">Add workspace</button>
                 <p class="form-error" data-error hidden></p>
               </form>
             </div>
@@ -527,6 +703,164 @@
           </div>
           <p class="form-error" id="alerts-error" hidden></p>
         </div>
+      </div>
+    </div>
+
+    <!-- ==================== PUBLIC TUNNEL PROMPT ==================== -->
+    <div id="tunnel-modal" class="modal" hidden>
+      <div class="modal-backdrop" data-close="1"></div>
+      <div class="modal-card small">
+        <header class="modal-header">
+          <h2>Open public tunnel</h2>
+          <button class="ghost-btn" data-close="1" title="Close">✕</button>
+        </header>
+        <form id="tunnel-form" class="form-stack">
+          <p class="help-text">
+            Exposes a local port on this service to the public internet via a
+            Cloudflare Quick Tunnel. Anyone with the URL can reach it — treat
+            it as if it were open on 0.0.0.0.
+          </p>
+          <label>
+            <span>Local port</span>
+            <input
+              name="port"
+              id="tunnel-port-input"
+              type="number"
+              min="1"
+              max="65535"
+              value="3000"
+              required
+            />
+          </label>
+          <div class="tunnel-port-suggestions" id="tunnel-port-suggestions">
+            <button type="button" data-port="3000">3000</button>
+            <button type="button" data-port="3030">3030</button>
+            <button type="button" data-port="5173">5173</button>
+            <button type="button" data-port="8000">8000</button>
+            <button type="button" data-port="8080">8080</button>
+          </div>
+          <button type="submit" class="btn btn-primary" id="tunnel-open-btn">Open tunnel</button>
+          <p class="form-error" id="tunnel-error" hidden></p>
+        </form>
+      </div>
+    </div>
+
+    <!-- ==================== PORT CONFLICT MODAL ==================== -->
+    <div id="port-conflict-modal" class="modal" hidden>
+      <div class="modal-backdrop" data-close="1"></div>
+      <div class="modal-card small">
+        <header class="modal-header">
+          <h2>Port already in use</h2>
+          <button class="ghost-btn" data-close="1" title="Close">✕</button>
+        </header>
+        <div class="port-conflict-body">
+          <p id="port-conflict-summary" class="port-conflict-summary">—</p>
+          <dl class="port-conflict-details">
+            <div><dt>Port</dt><dd id="port-conflict-port">—</dd></div>
+            <div><dt>PID</dt><dd id="port-conflict-pid">—</dd></div>
+            <div><dt>Command</dt><dd id="port-conflict-cmd">—</dd></div>
+            <div><dt>User</dt><dd id="port-conflict-user">—</dd></div>
+          </dl>
+          <p class="help-text">
+            <strong>Kill &amp; Start</strong> sends SIGTERM (then SIGKILL after
+            500ms if it's stubborn) and immediately retries the service.
+          </p>
+          <div class="port-conflict-actions">
+            <button id="port-conflict-cancel" class="btn btn-ghost" type="button">Cancel</button>
+            <button id="port-conflict-force" class="btn" type="button" title="Start anyway without killing (will fail if the collision is real)">Force start</button>
+            <button id="port-conflict-kill" class="btn btn-stop" type="button">Kill &amp; Start</button>
+          </div>
+          <p class="form-error" id="port-conflict-error" hidden></p>
+        </div>
+      </div>
+    </div>
+
+    <!-- ==================== HTTP INSPECTOR MODAL ==================== -->
+    <div id="inspector-modal" class="modal" hidden>
+      <div class="modal-backdrop" data-close="1"></div>
+      <div class="modal-card wide">
+        <header class="modal-header">
+          <h2><span id="inspector-title">HTTP Traffic</span></h2>
+          <div class="me-actions">
+            <button id="inspector-clear-btn" class="ghost-btn" title="Clear captured requests">🗑</button>
+            <button class="ghost-btn" data-close="1" title="Close">✕</button>
+          </div>
+        </header>
+        <div class="inspector-toolbar">
+          <div class="inspector-toolbar-left">
+            <span id="inspector-state-dot" class="inspector-state-dot"></span>
+            <span id="inspector-state-label" class="inspector-state-label">inactive</span>
+          </div>
+          <input
+            id="inspector-filter"
+            class="inspector-filter"
+            type="search"
+            placeholder="Filter: method or URL substring…"
+          />
+          <input
+            id="inspector-target-port"
+            type="number"
+            min="1"
+            max="65535"
+            class="inspector-target-port"
+            placeholder="Target port"
+          />
+          <button id="inspector-toggle-btn" class="btn btn-primary" type="button">Start capture</button>
+        </div>
+        <div id="inspector-listen-banner" class="inspector-listen-banner" hidden>
+          <span class="inspector-listen-badge">SEND REQUESTS TO</span>
+          <a id="inspector-listen-url" class="inspector-listen-url" href="#" target="_blank" rel="noopener noreferrer">—</a>
+          <button id="inspector-listen-copy" class="btn btn-ghost" type="button" title="Copy listen URL">Copy</button>
+          <span id="inspector-listen-target" class="inspector-listen-target"></span>
+        </div>
+        <div class="inspector-body">
+          <div class="inspector-table-wrap">
+            <table class="inspector-table">
+              <thead>
+                <tr>
+                  <th>Method</th>
+                  <th>Status</th>
+                  <th>URL</th>
+                  <th>Latency</th>
+                  <th>Time</th>
+                </tr>
+              </thead>
+              <tbody id="inspector-rows"></tbody>
+            </table>
+            <div id="inspector-empty" class="service-empty inspector-empty">
+              <strong>Nothing captured yet.</strong>
+              <p>
+                The inspector is a <em>reverse proxy</em>: it binds a random
+                local port and forwards to your target. Refreshing your app
+                directly won't be seen — you have to send requests to the
+                <em>listen URL</em> shown above.
+              </p>
+              <p class="inspector-empty-hint">
+                e.g.
+                <code>curl http://127.0.0.1:&lt;listen&gt;/…</code>
+                or point your browser / API client there.
+              </p>
+            </div>
+          </div>
+          <aside id="inspector-details" class="inspector-details" hidden>
+            <header class="inspector-details-header">
+              <span id="inspector-detail-method" class="inspector-detail-method"></span>
+              <span id="inspector-detail-url" class="inspector-detail-url"></span>
+              <button id="inspector-detail-close" class="ghost-btn" title="Close details">✕</button>
+            </header>
+            <div class="inspector-detail-section">
+              <h4>Request headers</h4>
+              <pre id="inspector-detail-req-headers"></pre>
+              <h4>Request body <span id="inspector-detail-req-meta" class="inspector-detail-meta"></span></h4>
+              <pre id="inspector-detail-req-body"></pre>
+              <h4>Response headers</h4>
+              <pre id="inspector-detail-res-headers"></pre>
+              <h4>Response body <span id="inspector-detail-res-meta" class="inspector-detail-meta"></span></h4>
+              <pre id="inspector-detail-res-body"></pre>
+            </div>
+          </aside>
+        </div>
+        <p class="form-error" id="inspector-error" hidden></p>
       </div>
     </div>
 

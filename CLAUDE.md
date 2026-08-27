@@ -99,3 +99,27 @@ The HTML `hidden` attribute is used to toggle visibility of view containers and 
 ### SFTP
 
 `server/sftp.js` opens a *fresh* SSH connection per operation (list/download/upload/mkdir/delete) rather than reusing the long-lived shell session — keeps memory bounded and lets the shell and SFTP work in parallel. Uploads stream through `busboy` directly into `sftp.createWriteStream`, no memory buffering.
+
+### Workspaces (graphical container streaming)
+
+`server/WorkspaceManager.js` is a parallel hierarchy to TaskManager for browser-streamed desktops (KasmVNC / noVNC). Templates persist in `workspaces.json`; instances are ephemeral containers via `server/sessions/WorkspaceSession.js`. Instances auto-stop after `DEFAULT_IDLE_TIMEOUT_MS` (30 min) with zero viewers — refcounted so a browser refresh doesn't kill the desktop.
+
+`server/vncProxy.js` is a hand-rolled reverse proxy (no `http-proxy` dep) for the workspace's HTTP page and its WebSocket. It strips `X-Frame-Options` / `Content-Security-Policy` from responses so the noVNC page can render inside our `<iframe>`, and disables TLS verification because the backend is always 127.0.0.1 with a per-container self-signed cert.
+
+**WebSocket upgrade dispatcher** (`installWorkspaceUpgradeDispatcher` in `server/index.js`) is load-bearing: it snapshots Socket.IO's `upgrade` listeners, replaces them with its own, and routes workspace-proxy upgrades before Socket.IO ever sees them. It runs `sessionMiddleware` against a *dummy* `ServerResponse` to populate `req.session` for auth, then detaches the socket before piping. If you add another WebSocket subsystem, extend this dispatcher — do not re-register a competing `upgrade` handler.
+
+The `/api/workspaces/:id/stream` mount also has to sit **before** `express.json()` so upload bodies inside the noVNC UI reach the container unread; that ordering in `server/index.js` is deliberate.
+
+### Ephemeral scratchpads
+
+`server/scratchpadContainer.js` spins up throwaway Docker containers (default `ubuntu:latest`, override via `SCRATCHPAD_IMAGE`). Every scratchpad is registered as a *service* with `ephemeral: true`, wired to a `DockerSession` — but its definition is excluded from `services.json` via `manager.persistentDefinitions()`. Containers are labeled `com.shellhelper.scratchpad` so `reapOrphanedScratchpads()` can sweep survivors of a previous crash on boot.
+
+Ephemerals self-destruct in two places: `TaskManager` emits `removed` when the inner shell exits, and `maybeReapEphemeral(id)` runs when the last viewer socket leaves the room. Both paths route through `destroyScratchpad()`, which is idempotent.
+
+### Public tunnels (cloudflared)
+
+`server/TunnelManager.js` shells out to `cloudflared tunnel --url http://localhost:<port>` and parses `https://…trycloudflare.com` from stderr/stdout line-by-line via `readline`. One tunnel per service (`Map<serviceId, {proc, url, port}>`). The `cloudflared` binary is discovered via `$PATH` or `CLOUDFLARED_BIN`; ENOENT surfaces a friendly install-me error rather than crashing.
+
+Tunnels are torn down automatically on `manager.on('exit')` (which covers user-initiated stop, crashes, and restart's stop→start) and on admin delete. If you add another code path that stops a service without going through `manager.stopService`, call `tunnels.stop(id)` explicitly.
+
+REST: `POST/GET /api/services/:id/tunnel/{start,stop,status}`. Socket: `tunnel-status` broadcast to the service room; also pushed to freshly-joined viewers inside `subscribe-service`.
